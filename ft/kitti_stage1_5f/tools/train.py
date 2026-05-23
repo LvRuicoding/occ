@@ -33,11 +33,13 @@ from ..datasets import (
     KITTI_SSC_CLASS_NAMES,
     Kitti5FrameStage1Dataset,
     Kitti5FrameStage1MonoDataset,
+    Kitti5FrameStage1MonoLidarDataset,
     collate_stage1,
     collate_stage1_mono,
+    collate_stage1_mono_lidar,
 )
 from ..losses_monoscene import MonoSceneSSCLoss
-from ..models import Stage1SSCModel, Stage1SSCMonoModel
+from ..models import Stage1SSCModel, Stage1SSCMonoModel, Stage1SSCMonoLidarModel
 
 
 def get_args_parser() -> argparse.ArgumentParser:
@@ -83,11 +85,22 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval_only", action="store_true")
 
     # Which experiment variant to run.
-    #   - "light":     existing LightOcc3DUNet head + CE+Lovasz loss.
-    #   - "monoscene": vendored MonoScene UNet3D head (context_prior=True) via
-    #                  adapter, + CE+sem_scal+geo_scal+relation_ce loss
-    #                  (requires <frame>_1_8.npy under processed_root).
-    p.add_argument("--exp", choices=["light", "monoscene"], default="light")
+    #   - "light":            existing LightOcc3DUNet head + CE+Lovasz loss.
+    #   - "monoscene":        vendored MonoScene UNet3D head (context_prior=True)
+    #                         via adapter, + CE+sem_scal+geo_scal+relation_ce
+    #                         loss (requires <frame>_1_8.npy under processed_root).
+    #   - "monoscene_lidar":  same as monoscene + a LiDAR cross-attention fusion
+    #                         block applied to OccAny's reconstruction tokens
+    #                         (post-decoder, pre-lifting). The OccAny backbone
+    #                         stays fully frozen; only fusion/lifting/head train.
+    #                         Requires --velodyne_root.
+    p.add_argument("--exp", choices=["light", "monoscene", "monoscene_lidar"], default="light")
+    # LiDAR-fusion-only options.
+    p.add_argument("--velodyne_root", default=None, type=str,
+                   help="Raw KITTI Odometry root: <velodyne_root>/sequences/<seq>/velodyne/*.bin. "
+                        "Required when --exp=monoscene_lidar.")
+    p.add_argument("--max_points_per_sweep", type=int, default=0,
+                   help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
     # Whether to convert BatchNorm layers to SyncBatchNorm under DDP. "auto"
     # (default) turns it on for the monoscene head (which is BN-heavy and
     # otherwise broken at per-GPU bs=1) and leaves the light head alone (it
@@ -105,13 +118,25 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
         output_resolution=(args.width, args.height),
         cam_idx=0,
     )
+    if args.exp == "monoscene_lidar":
+        if not args.velodyne_root:
+            raise ValueError("--velodyne_root is required when --exp=monoscene_lidar")
+        return Kitti5FrameStage1MonoLidarDataset(
+            velodyne_root=args.velodyne_root,
+            max_points_per_sweep=args.max_points_per_sweep,
+            **common,
+        )
     if args.exp == "monoscene":
         return Kitti5FrameStage1MonoDataset(**common)
     return Kitti5FrameStage1Dataset(**common)
 
 
 def _collate_fn(args):
-    return collate_stage1_mono if args.exp == "monoscene" else collate_stage1
+    if args.exp == "monoscene_lidar":
+        return collate_stage1_mono_lidar
+    if args.exp == "monoscene":
+        return collate_stage1_mono
+    return collate_stage1
 
 
 def _build_loader(args, dataset: Kitti5FrameStage1Dataset, train: bool) -> DataLoader:
@@ -164,6 +189,66 @@ def _move_views_to_device(views: List[Dict[str, torch.Tensor]], device: torch.de
     return moved
 
 
+def _move_points_to_device(
+    points_per_frame: List[List[torch.Tensor]], device: torch.device
+) -> List[List[torch.Tensor]]:
+    """Recursively move the variable-length LiDAR sweeps onto device."""
+    return [
+        [pts.to(device, non_blocking=True) for pts in per_sample]
+        for per_sample in points_per_frame
+    ]
+
+
+def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
+    """Dispatch the model forward to match each experiment's signature."""
+    views = _move_views_to_device(batch["views"], device)
+    T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
+    if args.exp == "monoscene_lidar":
+        return model(
+            views,
+            T_target_from_refcam,
+            _move_points_to_device(batch["points_per_frame"], device),
+            batch["T_cam_from_velo"].to(device, non_blocking=True),
+            batch["K_per_frame"].to(device, non_blocking=True),
+            batch["image_hw"].to(device, non_blocking=True),
+        )
+    return model(views, T_target_from_refcam)
+
+
+def _sanitize_metric_key(name: str) -> str:
+    return str(name).replace(" ", "_").replace("-", "_").replace("/", "_")
+
+
+def _float_list(values) -> List[float]:
+    return [float(v) for v in values]
+
+
+def _per_class_iou_dict(stats: Dict) -> Dict[str, float]:
+    names = stats.get("class_names", [])
+    values = stats.get("iou_per_class", [])
+    return {str(name): float(iou) for name, iou in zip(names, values)}
+
+
+def _build_log_stats(epoch: int, train_stats: Dict, val_stats: Dict) -> Dict:
+    log_stats = dict(
+        epoch=epoch,
+        **{f"train_{k}": v for k, v in train_stats.items()},
+    )
+    for k, v in val_stats.items():
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            log_stats[f"val_{k}"] = float(v)
+
+    if "class_names" in val_stats and "iou_per_class" in val_stats:
+        per_class_iou = _per_class_iou_dict(val_stats)
+        log_stats["val_class_names"] = [str(name) for name in val_stats["class_names"]]
+        log_stats["val_iou_per_class"] = _float_list(val_stats["iou_per_class"])
+        log_stats["val_iou_per_class_by_name"] = per_class_iou
+        for class_name, iou in per_class_iou.items():
+            log_stats[f"val_iou_class_{_sanitize_metric_key(class_name)}"] = iou
+
+    return log_stats
+
+
 def _adjust_lr(optimizer, epoch_f: float, args) -> float:
     if epoch_f < args.warmup_epochs:
         lr = args.lr * epoch_f / max(args.warmup_epochs, 1)
@@ -201,8 +286,6 @@ def train_one_epoch(
         if step % accum == 0:
             _adjust_lr(optimizer, epoch_f, args)
 
-        views = _move_views_to_device(batch["views"], device)
-        T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
         target = batch["voxel_label"].to(device, non_blocking=True)
 
         amp_dtype = (
@@ -215,8 +298,8 @@ def train_one_epoch(
         )
 
         with ctx:
-            out = model(views, T_target_from_refcam)
-            if args.exp == "monoscene":
+            out = _model_forward(model, batch, device, args)
+            if args.exp in ("monoscene", "monoscene_lidar"):
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, details = criterion(out, target, cp)
             else:
@@ -274,8 +357,6 @@ def eval_one_epoch(
         torch.bfloat16 if args.amp == "bf16" else (torch.float16 if args.amp == "fp16" else None)
     )
     for batch in loader:
-        views = _move_views_to_device(batch["views"], device)
-        T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
         target = batch["voxel_label"].to(device, non_blocking=True)
 
         ctx = (
@@ -284,8 +365,8 @@ def eval_one_epoch(
             else torch.autocast("cuda", enabled=False)
         )
         with ctx:
-            out = model(views, T_target_from_refcam)
-            if args.exp == "monoscene":
+            out = _model_forward(model, batch, device, args)
+            if args.exp in ("monoscene", "monoscene_lidar"):
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, _details = criterion(out, target, cp)
                 logits = out["ssc_logit"]
@@ -331,6 +412,8 @@ def eval_one_epoch(
         log_writer.add_scalar("val/mIoU", stats["mIoU"], it)
         log_writer.add_scalar("val/precision", stats["precision"], it)
         log_writer.add_scalar("val/recall", stats["recall"], it)
+        for class_name, iou in _per_class_iou_dict(stats).items():
+            log_writer.add_scalar(f"val/iou_class/{class_name}", iou, it)
     print(
         f"Val [{epoch}] loss={loss_avg:.4f} IoU={stats['iou']*100:.2f} "
         f"mIoU={stats['mIoU']*100:.2f} P={stats['precision']*100:.2f} "
@@ -366,7 +449,12 @@ def main():
     else:
         backbone_dtype = torch.float32
 
-    model_cls = Stage1SSCMonoModel if args.exp == "monoscene" else Stage1SSCModel
+    if args.exp == "monoscene_lidar":
+        model_cls = Stage1SSCMonoLidarModel
+    elif args.exp == "monoscene":
+        model_cls = Stage1SSCMonoModel
+    else:
+        model_cls = Stage1SSCModel
     model = model_cls(
         occany_ckpt=args.occany_ckpt,
         c_lift=args.c_lift,
@@ -378,8 +466,11 @@ def main():
     ).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
 
-    # Freeze OccAny backbone; train lifting (+ adapter, in the monoscene case)
-    # and the occ_head only.
+    # Freeze the OccAny backbone in every variant (light / monoscene /
+    # monoscene_lidar). Trainable params:
+    #   light:            lifting + occ_head
+    #   monoscene:        lifting + occ_head (incl. monoscene adapter)
+    #   monoscene_lidar:  lifting + occ_head + fusion (VFE + W-MSA/SW-MSA)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
@@ -392,7 +483,8 @@ def main():
     # running stats -- exactly the train-down/val-up divergence we observed
     # without this step. Light head uses GroupNorm so it's unaffected.
     syncbn_on = args.distributed and (
-        args.syncbn == "on" or (args.syncbn == "auto" and args.exp == "monoscene")
+        args.syncbn == "on"
+        or (args.syncbn == "auto" and args.exp in ("monoscene", "monoscene_lidar"))
     )
     if syncbn_on:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -401,12 +493,15 @@ def main():
         print(f"[syncbn] disabled (mode={args.syncbn}, distributed={args.distributed}).")
 
     if args.distributed:
-        model = nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[args.gpu],
-            find_unused_parameters=False,
-            static_graph=True,
-        )
+        # monoscene_lidar's fusion sub-modules may not fire on a batch with no
+        # valid voxel projections, and the per-sample point cloud changes which
+        # windows are active — both incompatible with static_graph=True.
+        ddp_kwargs = dict(device_ids=[args.gpu])
+        if args.exp == "monoscene_lidar":
+            ddp_kwargs.update(find_unused_parameters=True, static_graph=False)
+        else:
+            ddp_kwargs.update(find_unused_parameters=False, static_graph=True)
+        model = nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
         model_to_save = model.module
     else:
         model_to_save = model
@@ -420,7 +515,7 @@ def main():
         trainable_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
     )
     loss_scaler = NativeScaler(enabled=(args.amp == "fp16"))
-    if args.exp == "monoscene":
+    if args.exp in ("monoscene", "monoscene_lidar"):
         criterion = MonoSceneSSCLoss().to(device)
     else:
         criterion = SSCLoss().to(device)
@@ -445,6 +540,8 @@ def main():
             model_to_save.lifting.load_state_dict(ckpt["lifting"], strict=False)
         if "occ_head" in ckpt:
             model_to_save.occ_head.load_state_dict(ckpt["occ_head"], strict=False)
+        if "fusion" in ckpt and hasattr(model_to_save, "fusion"):
+            model_to_save.fusion.load_state_dict(ckpt["fusion"], strict=False)
         if "optimizer" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
@@ -486,33 +583,25 @@ def main():
                 "args": vars(args),
                 "backbone_hash": backbone_hash,
             }
+            if args.exp == "monoscene_lidar":
+                ckpt_payload["fusion"] = model_to_save.fusion.state_dict()
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
+                keep_payload = {
+                    "lifting": ckpt_payload["lifting"],
+                    "occ_head": ckpt_payload["occ_head"],
+                    "epoch": epoch,
+                    "backbone_hash": backbone_hash,
+                }
+                if "fusion" in ckpt_payload:
+                    keep_payload["fusion"] = ckpt_payload["fusion"]
                 torch.save(
-                    {
-                        "lifting": ckpt_payload["lifting"],
-                        "occ_head": ckpt_payload["occ_head"],
-                        "epoch": epoch,
-                        "backbone_hash": backbone_hash,
-                    },
+                    keep_payload,
                     os.path.join(args.output_dir, f"checkpoint-{epoch}.pth"),
                 )
             with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
-                f.write(
-                    json.dumps(
-                        dict(
-                            epoch=epoch,
-                            **{f"train_{k}": v for k, v in train_stats.items()},
-                            **{
-                                f"val_{k}": float(v) if isinstance(v, (int, float, np.floating)) else None
-                                for k, v in val_stats.items()
-                                if not isinstance(v, (list, np.ndarray))
-                            },
-                        )
-                    )
-                    + "\n"
-                )
+                f.write(json.dumps(_build_log_stats(epoch, train_stats, val_stats)) + "\n")
 
     dt = str(datetime.timedelta(seconds=int(time.time() - t0)))
     print(f"Done. Total time: {dt}")
