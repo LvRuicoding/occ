@@ -1,4 +1,21 @@
-"""Training entry for Stage-1 SSC fine-tuning of OccAny on SemanticKITTI."""
+"""Training entry for Stage-1 SSC fine-tuning of OccAny on SemanticKITTI.
+
+Example:
+  torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+      -m ft.kitti_stage1_5f.tools.train \
+      --processed_root /home/dataset-local/lr/code/OccAny/data/kitti_processed \
+      --kittiodo_root /home/dataset-local/lr/code/OccAny/raw_data/semantickitti \
+      --velodyne_root /home/dataset-local/lr/code/OccAny/data/kitti \
+      --occany_ckpt /home/dataset-local/lr/code/OccAny/checkpoints/occany_recon.pth \
+      --output_dir /home/dataset-local/lr/code/OccAny/output/kitti_stage1_5f_4gpu_monoscene_lidar_selfattn \
+      --exp monoscene_lidar \
+      --fusion_attn_type self \
+      --batch_size 1 \
+      --num_workers 6 \
+      --amp bf16 \
+      --epochs 40 \
+      --lr 1e-4
+"""
 from __future__ import annotations
 
 from .. import _paths  # noqa: F401  (must come first)
@@ -89,7 +106,7 @@ def get_args_parser() -> argparse.ArgumentParser:
     #   - "monoscene":        vendored MonoScene UNet3D head (context_prior=True)
     #                         via adapter, + CE+sem_scal+geo_scal+relation_ce
     #                         loss (requires <frame>_1_8.npy under processed_root).
-    #   - "monoscene_lidar":  same as monoscene + a LiDAR cross-attention fusion
+    #   - "monoscene_lidar":  same as monoscene + a LiDAR fusion
     #                         block applied to OccAny's reconstruction tokens
     #                         (post-decoder, pre-lifting). The OccAny backbone
     #                         stays fully frozen; only fusion/lifting/head train.
@@ -101,6 +118,10 @@ def get_args_parser() -> argparse.ArgumentParser:
                         "Required when --exp=monoscene_lidar.")
     p.add_argument("--max_points_per_sweep", type=int, default=0,
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
+    p.add_argument("--fusion_attn_type", choices=["self", "cross"], default="self",
+                   help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
+                        "'self' uses image+voxel window self-attention; 'cross' "
+                        "keeps the original image-query/voxel-KV cross-attention.")
     # Whether to convert BatchNorm layers to SyncBatchNorm under DDP. "auto"
     # (default) turns it on for the monoscene head (which is BN-heavy and
     # otherwise broken at per-GPU bs=1) and leaves the light head alone (it
@@ -455,7 +476,7 @@ def main():
         model_cls = Stage1SSCMonoModel
     else:
         model_cls = Stage1SSCModel
-    model = model_cls(
+    model_kwargs = dict(
         occany_ckpt=args.occany_ckpt,
         c_lift=args.c_lift,
         num_classes=20,
@@ -463,8 +484,13 @@ def main():
         token_dim=args.token_dim,
         backbone_img_size=(args.height, args.width),
         backbone_dtype=backbone_dtype,
-    ).to(device)
+    )
+    if args.exp == "monoscene_lidar":
+        model_kwargs["fusion_attn_type"] = args.fusion_attn_type
+    model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
+    if args.exp == "monoscene_lidar":
+        print(f"[fusion] attn_type={args.fusion_attn_type}")
 
     # Freeze the OccAny backbone in every variant (light / monoscene /
     # monoscene_lidar). Trainable params:

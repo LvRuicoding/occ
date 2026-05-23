@@ -7,13 +7,12 @@ Pipeline (per (sample, frame) pair, vectorized across the batch):
   2) Project each non-empty voxel center via the per-frame K (already matched to
      the resized image) → (h_t, w_t) patch coordinate, drop voxels with z_cam<=0
      or that fall outside the (H_t, W_t) patch grid.
-  3) Apply two Swin-style windowed cross-attention layers (window=(4,4),
-     shift=(0,0) then shift=(2,2)). Q=image patch tokens within a window,
-     KV=non-empty voxels projecting into that window. Boundary partial windows
-     and SW-MSA shifted boundary partial windows are handled with Q/KV masks.
-  4) Output is the input feature with a residual update applied where
-     cross-attention fired; windows that received no voxels pass through
-     unchanged.
+  3) Apply two Swin-style windowed fusion layers (window=(4,4), shift=(0,0)
+     then shift=(2,2)). The default Stage-1 LiDAR model uses self-attention over
+     [image tokens, projected voxel tokens] with modality embeddings; the
+     original image-query / voxel-KV cross-attention path is still available.
+  4) Output is the input image feature with a residual update applied to image
+     tokens only; voxel tokens are not forwarded to lifting.
 
 In the current Stage-1 pipeline this module operates on ``t_rec`` (the
 decoder-side patch tokens at D=768), inserted between OccAny's decoder and the
@@ -185,7 +184,7 @@ class VoxelFeatureEncoder(nn.Module):
 
 
 # ============================================================================
-# Windowed Cross-Attention (Q=image, KV=voxel)
+# Windowed Attention
 # ============================================================================
 
 
@@ -403,13 +402,175 @@ class WindowedCrossAttnLayer(nn.Module):
         return out
 
 
+class WindowedSelfAttnLayer(nn.Module):
+    """One layer: windowed self-attn over image tokens + projected voxel tokens.
+
+    For every image window, the sequence is:
+      [valid/padded image patch slots, voxel tokens projected into this window]
+
+    Modality embeddings are added before attention, but only image-token residual
+    updates are scattered back to the image feature map. Voxel tokens provide
+    context for the window and are not propagated to downstream lifting.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 768,
+        num_heads: int = 8,
+        window: int = 4,
+        shift: int = 0,
+        H_t: int = 10,
+        W_t: int = 32,
+        ffn_ratio: float = 2.0,
+        attn_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model {d_model} not divisible by num_heads {num_heads}")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.window = window
+        self.shift = shift
+        self.H_t = H_t
+        self.W_t = W_t
+        self.attn_dropout = attn_dropout
+
+        wh_grid, ww_grid, q_mask, n_win = _build_window_layout(H_t, W_t, window, shift)
+        self.register_buffer("win_h_grid", wh_grid, persistent=False)
+        self.register_buffer("win_w_grid", ww_grid, persistent=False)
+        self.register_buffer("win_q_mask", q_mask, persistent=False)
+        self.n_win = int(n_win)
+        self.M_Q = window * window
+        self.n_w = int(math.ceil((W_t + shift) / window))
+
+        self.modality_embed = nn.Embedding(2, d_model)
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.norm_ffn = nn.LayerNorm(d_model)
+        hidden = int(d_model * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def _voxel_window_id(
+        self, voxel_h_t: torch.Tensor, voxel_w_t: torch.Tensor
+    ) -> torch.Tensor:
+        """Map per-voxel (h_t, w_t) to a frame-relative flat window id."""
+        wh = (voxel_h_t + self.shift) // self.window
+        ww = (voxel_w_t + self.shift) // self.window
+        return wh * self.n_w + ww
+
+    def forward(
+        self,
+        image_feat: torch.Tensor,        # (F, H_t, W_t, D)
+        voxel_feat: torch.Tensor,        # (V_total, D), already projected to D
+        voxel_frame_idx: torch.Tensor,   # (V_total,) int64, 0..F-1
+        voxel_h_t: torch.Tensor,         # (V_total,) int64
+        voxel_w_t: torch.Tensor,         # (V_total,) int64
+        voxel_valid: torch.Tensor,       # (V_total,) bool
+    ) -> torch.Tensor:
+        F_n, H_t, W_t, D = image_feat.shape
+        device = image_feat.device
+        dtype = image_feat.dtype
+        if (H_t, W_t, D) != (self.H_t, self.W_t, self.d_model):
+            raise RuntimeError(
+                f"image_feat shape ({H_t},{W_t},{D}) != layer shape "
+                f"({self.H_t},{self.W_t},{self.d_model})."
+            )
+
+        valid_voxel_by_window = {}
+        if voxel_valid.numel() > 0 and bool(voxel_valid.any().item()):
+            vf_idx = voxel_frame_idx[voxel_valid]
+            vh_t = voxel_h_t[voxel_valid]
+            vw_t = voxel_w_t[voxel_valid]
+            v_feat = voxel_feat[voxel_valid].to(dtype=dtype)
+            v_win_local = self._voxel_window_id(vh_t, vw_t)
+            v_global = vf_idx * self.n_win + v_win_local
+
+            order = torch.argsort(v_global)
+            v_global = v_global[order]
+            v_feat = v_feat[order]
+            active, counts = torch.unique_consecutive(v_global, return_counts=True)
+            starts = torch.zeros_like(counts)
+            starts[1:] = counts.cumsum(0)[:-1]
+            for i in range(int(active.shape[0])):
+                start = int(starts[i].item())
+                end = start + int(counts[i].item())
+                valid_voxel_by_window[int(active[i].item())] = v_feat[start:end]
+
+        out = image_feat.clone()
+        image_mod = self.modality_embed.weight[0].to(dtype=dtype)
+        voxel_mod = self.modality_embed.weight[1].to(dtype=dtype)
+
+        Hh = self.num_heads
+        Dh = self.head_dim
+        for global_win in range(F_n * self.n_win):
+            frame_idx = global_win // self.n_win
+            local_win = global_win % self.n_win
+
+            h_grid = self.win_h_grid[local_win]
+            w_grid = self.win_w_grid[local_win]
+            q_mask = self.win_q_mask[local_win]
+            img_tokens = image_feat[frame_idx, h_grid, w_grid]  # (M_Q, D)
+
+            vox_tokens = valid_voxel_by_window.get(global_win)
+            if vox_tokens is None:
+                base_tokens = img_tokens
+                token_valid = q_mask
+                tokens = base_tokens + image_mod
+            else:
+                base_tokens = torch.cat([img_tokens, vox_tokens], dim=0)
+                voxel_valid_mask = torch.ones(
+                    (vox_tokens.shape[0],), dtype=torch.bool, device=device
+                )
+                token_valid = torch.cat([q_mask, voxel_valid_mask], dim=0)
+                img_with_mod = img_tokens + image_mod
+                vox_with_mod = vox_tokens + voxel_mod
+                tokens = torch.cat([img_with_mod, vox_with_mod], dim=0)
+
+            L = int(tokens.shape[0])
+            attn_in = self.norm_attn(tokens)
+            q = self.q_proj(attn_in).view(1, L, Hh, Dh).transpose(1, 2)
+            k = self.k_proj(attn_in).view(1, L, Hh, Dh).transpose(1, 2)
+            v = self.v_proj(attn_in).view(1, L, Hh, Dh).transpose(1, 2)
+
+            attn_mask = token_valid.view(1, 1, 1, L).expand(1, 1, L, L)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(L, D)
+            attn_out = self.out_proj(attn_out)
+
+            res_tokens = base_tokens + attn_out
+            ffn_out = self.ffn(self.norm_ffn(res_tokens))
+            update = attn_out + ffn_out
+
+            img_update = update[: self.M_Q] * q_mask.unsqueeze(-1).to(dtype)
+            valid_h = h_grid[q_mask]
+            valid_w = w_grid[q_mask]
+            out[frame_idx, valid_h, valid_w] = (
+                out[frame_idx, valid_h, valid_w] + img_update[q_mask]
+            )
+
+        return out
+
+
 # ============================================================================
 # Top-level fusion module
 # ============================================================================
 
 
 class LidarImageFusionModule(nn.Module):
-    """VFE + projection + two windowed cross-attention layers (W-MSA + SW-MSA).
+    """VFE + projection + two windowed fusion layers (W-MSA + SW-MSA).
 
     Designed to sit between OccAny's encoder and decoder. Input/output ``x``
     has shape (B, N, n_patches, D_enc).
@@ -430,12 +591,16 @@ class LidarImageFusionModule(nn.Module):
         vfe_hidden: int = 64,
         pe_num_freqs: int = 8,
         ffn_ratio: float = 2.0,
+        attn_type: str = "cross",
     ) -> None:
         super().__init__()
+        if attn_type not in ("cross", "self"):
+            raise ValueError(f"attn_type must be 'cross' or 'self'; got {attn_type!r}")
         self.d_model = d_model
         self.H_t = H_t
         self.W_t = W_t
         self.patch_size = int(patch_size)
+        self.attn_type = attn_type
 
         self.vfe = VoxelFeatureEncoder(
             vox_origin=vox_origin,
@@ -446,11 +611,12 @@ class LidarImageFusionModule(nn.Module):
             hidden=vfe_hidden,
             pe_num_freqs=pe_num_freqs,
         )
-        self.layer_w = WindowedCrossAttnLayer(
+        layer_cls = WindowedSelfAttnLayer if attn_type == "self" else WindowedCrossAttnLayer
+        self.layer_w = layer_cls(
             d_model=d_model, num_heads=num_heads, window=window, shift=0,
             H_t=H_t, W_t=W_t, ffn_ratio=ffn_ratio,
         )
-        self.layer_sw = WindowedCrossAttnLayer(
+        self.layer_sw = layer_cls(
             d_model=d_model, num_heads=num_heads, window=window, shift=window // 2,
             H_t=H_t, W_t=W_t, ffn_ratio=ffn_ratio,
         )
@@ -540,14 +706,21 @@ class LidarImageFusionModule(nn.Module):
                 all_voxel_valid.append(valid)
 
         if len(all_voxel_feats) == 0:
-            # No voxels at all in the entire batch — return identity.
-            return t_rec
-
-        voxel_feat_cat = torch.cat(all_voxel_feats, dim=0)
-        voxel_frame_idx_cat = torch.cat(all_voxel_frame_idx, dim=0)
-        voxel_h_t_cat = torch.cat(all_voxel_h_t, dim=0)
-        voxel_w_t_cat = torch.cat(all_voxel_w_t, dim=0)
-        voxel_valid_cat = torch.cat(all_voxel_valid, dim=0)
+            if self.attn_type == "cross":
+                # No voxels at all in the entire batch — original cross-attn
+                # behavior is identity.
+                return t_rec
+            voxel_feat_cat = image_feat.new_zeros((0, D))
+            voxel_frame_idx_cat = torch.zeros((0,), dtype=torch.long, device=device)
+            voxel_h_t_cat = torch.zeros((0,), dtype=torch.long, device=device)
+            voxel_w_t_cat = torch.zeros((0,), dtype=torch.long, device=device)
+            voxel_valid_cat = torch.zeros((0,), dtype=torch.bool, device=device)
+        else:
+            voxel_feat_cat = torch.cat(all_voxel_feats, dim=0)
+            voxel_frame_idx_cat = torch.cat(all_voxel_frame_idx, dim=0)
+            voxel_h_t_cat = torch.cat(all_voxel_h_t, dim=0)
+            voxel_w_t_cat = torch.cat(all_voxel_w_t, dim=0)
+            voxel_valid_cat = torch.cat(all_voxel_valid, dim=0)
 
         # Match dtype to the image features (autocast may have it in bf16).
         voxel_feat_cat = voxel_feat_cat.to(dtype=image_feat.dtype)
@@ -576,5 +749,6 @@ class LidarImageFusionModule(nn.Module):
 __all__ = [
     "VoxelFeatureEncoder",
     "WindowedCrossAttnLayer",
+    "WindowedSelfAttnLayer",
     "LidarImageFusionModule",
 ]

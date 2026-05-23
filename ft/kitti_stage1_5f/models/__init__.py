@@ -7,6 +7,7 @@ from .lidar_fusion import (
     LidarImageFusionModule,
     VoxelFeatureEncoder,
     WindowedCrossAttnLayer,
+    WindowedSelfAttnLayer,
 )
 from .stage1_ssc_mono_lidar import Stage1SSCMonoLidarModel
 
@@ -19,4 +20,5 @@ __all__ = [
     "LidarImageFusionModule",
     "VoxelFeatureEncoder",
     "WindowedCrossAttnLayer",
+    "WindowedSelfAttnLayer",
 ]

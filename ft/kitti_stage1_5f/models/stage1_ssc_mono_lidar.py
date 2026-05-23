@@ -1,10 +1,12 @@
 """Stage-1 SSC + MonoScene head + LiDAR fusion on the post-decoder t_rec.
 
 Same as ``Stage1SSCMonoModel`` except that the (frozen) OccAny reconstruction
-backbone's ``t_rec`` patch tokens are passed through a LiDAR-image cross-
-attention block before being handed to the lifting module. The OccAny encoder
-and decoder stay fully frozen and remain inside ``@torch.no_grad()``; only the
-fusion module, lifting, and occ_head are trained.
+backbone's ``t_rec`` patch tokens are passed through a LiDAR-image fusion block
+before being handed to the lifting module. The default fusion interaction is
+windowed image+voxel self-attention; the original cross-attention path remains
+available via ``fusion_attn_type="cross"``. The OccAny encoder and decoder stay
+fully frozen and remain inside ``@torch.no_grad()``; only the fusion module,
+lifting, and occ_head are trained.
 
 Forward signature adds the LiDAR/calib inputs produced by
 ``Kitti5FrameStage1MonoLidarDataset`` + ``collate_stage1_mono_lidar``.
@@ -49,6 +51,7 @@ class Stage1SSCMonoLidarModel(nn.Module):
         fusion_window: int = 4,
         fusion_d_voxel: int = 128,
         fusion_pe_num_freqs: int = 8,
+        fusion_attn_type: str = "self",
     ) -> None:
         super().__init__()
         if c_lift != 64:
@@ -79,6 +82,7 @@ class Stage1SSCMonoLidarModel(nn.Module):
             vox_grid=fusion_vox_grid,
             vfe_d_voxel=fusion_d_voxel,
             pe_num_freqs=fusion_pe_num_freqs,
+            attn_type=fusion_attn_type,
         )
 
         self.lifting = Stage1LiftingModule(
