@@ -564,16 +564,284 @@ class WindowedSelfAttnLayer(nn.Module):
         return out
 
 
+class Sorted3DTokenFusionLayer(nn.Module):
+    """Self-attention over 3D-sorted image and voxel token chunks.
+
+    For each flattened frame independently:
+      1) compute one local-camera 3D coordinate per image patch from the local
+         pointmap using confidence-weighted pooling;
+      2) quantize image and voxel coordinates into the same VFE grid;
+      3) sort tokens by z -> y -> x serpentine order and split into fixed-length
+         chunks;
+      4) run self-attention only on chunks containing both image and voxel tokens;
+      5) scatter updates back to image tokens only through a gated residual.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 768,
+        num_heads: int = 8,
+        seq_len: int = 80,
+        patch_size: int = 16,
+        vox_origin: Tuple[float, float, float] = (-25.6, -2.0, 0.0),
+        vox_size: Tuple[float, float, float] = (0.4, 0.4, 0.4),
+        vox_grid: Tuple[int, int, int] = (128, 16, 128),
+        ffn_ratio: float = 2.0,
+        conf_clamp_max: float = 50.0,
+        alpha_init: float = 0.0,
+        attn_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model {d_model} not divisible by num_heads {num_heads}")
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {seq_len}")
+
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = int(d_model) // int(num_heads)
+        self.seq_len = int(seq_len)
+        self.patch_size = int(patch_size)
+        self.vox_grid: Tuple[int, int, int] = tuple(int(v) for v in vox_grid)
+        self.conf_clamp_max = float(conf_clamp_max)
+        self.attn_dropout = float(attn_dropout)
+
+        self.register_buffer(
+            "vox_origin", torch.tensor(vox_origin, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "vox_size", torch.tensor(vox_size, dtype=torch.float32), persistent=False
+        )
+
+        self.type_embed = nn.Embedding(2, d_model)
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        hidden = int(d_model * ffn_ratio)
+        self.norm_mlp = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
+
+    def _patch_points_from_pointmap(
+        self,
+        p_rec_local: torch.Tensor,  # (B, N, H_p, W_p, 3)
+        c_rec: torch.Tensor,        # (B, N, H_p, W_p)
+        H_t: int,
+        W_t: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, N, H_p, W_p, _ = p_rec_local.shape
+        if H_p != H_t * self.patch_size or W_p != W_t * self.patch_size:
+            raise RuntimeError(
+                f"local pointmap shape ({H_p},{W_p}) is incompatible with "
+                f"patch grid ({H_t},{W_t}) and patch_size={self.patch_size}."
+            )
+
+        pts = p_rec_local.reshape(B, N, H_t, self.patch_size, W_t, self.patch_size, 3)
+        conf = c_rec.reshape(B, N, H_t, self.patch_size, W_t, self.patch_size)
+        finite = torch.isfinite(pts).all(dim=-1) & torch.isfinite(conf) & (conf > 0)
+        weights = conf.clamp(max=self.conf_clamp_max) * finite.to(conf.dtype)
+        sum_w = weights.sum(dim=(3, 5))
+        sum_wp = (pts * weights.unsqueeze(-1)).sum(dim=(3, 5))
+        patch_points = sum_wp / sum_w.clamp_min(1e-6).unsqueeze(-1)
+        valid = sum_w > 0
+        return patch_points, valid
+
+    def _coord_to_grid(
+        self,
+        coords: torch.Tensor,  # (T, 3), local camera coords
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        coords_f = coords.to(dtype=torch.float32)
+        idx = ((coords_f - self.vox_origin) / self.vox_size).floor().long()
+        Gx, Gy, Gz = self.vox_grid
+        valid = (
+            torch.isfinite(coords_f).all(dim=-1)
+            & (idx[:, 0] >= 0) & (idx[:, 0] < Gx)
+            & (idx[:, 1] >= 0) & (idx[:, 1] < Gy)
+            & (idx[:, 2] >= 0) & (idx[:, 2] < Gz)
+        )
+        return idx, valid
+
+    def _serpentine_key(self, idx: torch.Tensor) -> torch.Tensor:
+        """Return z-major, y-minor, x-minor serpentine scan keys."""
+        Gx, Gy, _Gz = self.vox_grid
+        ix = idx[:, 0]
+        iy = idx[:, 1]
+        iz = idx[:, 2]
+
+        # Alternate y direction across z layers, then alternate x direction
+        # across the scanned rows to preserve local continuity.
+        y_scan = torch.where((iz % 2) == 0, iy, (Gy - 1) - iy)
+        x_scan = torch.where(((iz + y_scan) % 2) == 0, ix, (Gx - 1) - ix)
+        return (iz * Gy + y_scan) * Gx + x_scan
+
+    def forward(
+        self,
+        image_feat: torch.Tensor,         # (B*N, H_t, W_t, D)
+        p_rec_local: torch.Tensor,        # (B, N, H_p, W_p, 3)
+        c_rec: torch.Tensor,              # (B, N, H_p, W_p)
+        voxel_feat: torch.Tensor,         # (V_total, D)
+        voxel_center_cam: torch.Tensor,   # (V_total, 3)
+        voxel_frame_idx: torch.Tensor,    # (V_total,) int64, 0..B*N-1
+    ) -> torch.Tensor:
+        F_n, H_t, W_t, D = image_feat.shape
+        B, N = p_rec_local.shape[:2]
+        if B * N != F_n:
+            raise RuntimeError(
+                f"image frames ({F_n}) != local pointmap batch*frames ({B}*{N})."
+            )
+        if D != self.d_model:
+            raise RuntimeError(f"image feature dim {D} != d_model {self.d_model}.")
+
+        device = image_feat.device
+        dtype = image_feat.dtype
+        patch_points, patch_valid = self._patch_points_from_pointmap(
+            p_rec_local.to(device=device),
+            c_rec.to(device=device),
+            H_t,
+            W_t,
+        )
+        patch_points = patch_points.reshape(F_n, H_t * W_t, 3)
+        patch_valid = patch_valid.reshape(F_n, H_t * W_t)
+
+        out = image_feat.clone()
+        img_feat_flat = image_feat.reshape(F_n, H_t * W_t, D)
+        voxel_feat = voxel_feat.to(device=device, dtype=dtype)
+        voxel_center_cam = voxel_center_cam.to(device=device)
+        voxel_frame_idx = voxel_frame_idx.to(device=device)
+
+        Hh = self.num_heads
+        Dh = self.head_dim
+        S = self.seq_len
+        alpha = self.alpha.to(dtype=dtype)
+
+        for frame_idx in range(F_n):
+            img_idx = torch.nonzero(patch_valid[frame_idx], as_tuple=False).flatten()
+            if img_idx.numel() == 0:
+                continue
+
+            img_coords = patch_points[frame_idx, img_idx]
+            img_grid_idx, img_grid_valid = self._coord_to_grid(img_coords)
+            if not bool(img_grid_valid.any().item()):
+                continue
+            img_idx = img_idx[img_grid_valid]
+            img_grid_idx = img_grid_idx[img_grid_valid]
+            img_tokens = img_feat_flat[frame_idx, img_idx]
+
+            vox_mask = voxel_frame_idx == frame_idx
+            if not bool(vox_mask.any().item()):
+                continue
+            vox_tokens = voxel_feat[vox_mask]
+            vox_coords = voxel_center_cam[vox_mask]
+            vox_grid_idx, vox_grid_valid = self._coord_to_grid(vox_coords)
+            if not bool(vox_grid_valid.any().item()):
+                continue
+            vox_tokens = vox_tokens[vox_grid_valid]
+            vox_grid_idx = vox_grid_idx[vox_grid_valid]
+
+            tokens = torch.cat([img_tokens, vox_tokens], dim=0)
+            grid_idx = torch.cat([img_grid_idx, vox_grid_idx], dim=0)
+            type_ids = torch.cat(
+                [
+                    torch.zeros((img_tokens.shape[0],), dtype=torch.long, device=device),
+                    torch.ones((vox_tokens.shape[0],), dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+            image_dst = torch.cat(
+                [
+                    img_idx.to(device=device),
+                    torch.full(
+                        (vox_tokens.shape[0],),
+                        -1,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                ],
+                dim=0,
+            )
+
+            order = torch.argsort(self._serpentine_key(grid_idx))
+            tokens = tokens[order]
+            type_ids = type_ids[order]
+            image_dst = image_dst[order]
+
+            L = int(tokens.shape[0])
+            n_chunks = (L + S - 1) // S
+            padded = n_chunks * S
+            tokens_pad = tokens.new_zeros((padded, D))
+            valid_pad = torch.zeros((padded,), dtype=torch.bool, device=device)
+            type_pad = torch.zeros((padded,), dtype=torch.long, device=device)
+            image_dst_pad = torch.full((padded,), -1, dtype=torch.long, device=device)
+            tokens_pad[:L] = tokens
+            valid_pad[:L] = True
+            type_pad[:L] = type_ids
+            image_dst_pad[:L] = image_dst
+
+            valid_chunks = valid_pad.reshape(n_chunks, S)
+            type_chunks = type_pad.reshape(n_chunks, S)
+            active = (
+                (valid_chunks & (type_chunks == 0)).any(dim=1)
+                & (valid_chunks & (type_chunks == 1)).any(dim=1)
+            )
+            if not bool(active.any().item()):
+                continue
+
+            token_chunks = tokens_pad.reshape(n_chunks, S, D)[active]
+            valid_active = valid_chunks[active]
+            type_active = type_chunks[active]
+            image_dst_active = image_dst_pad.reshape(n_chunks, S)[active]
+
+            token_chunks = token_chunks + (
+                self.type_embed(type_active).to(dtype=dtype)
+                * valid_active.unsqueeze(-1).to(dtype=dtype)
+            )
+
+            attn_in = self.norm_attn(token_chunks)
+            n_active = int(attn_in.shape[0])
+            q = self.q_proj(attn_in).view(n_active, S, Hh, Dh).transpose(1, 2)
+            k = self.k_proj(attn_in).view(n_active, S, Hh, Dh).transpose(1, 2)
+            v = self.v_proj(attn_in).view(n_active, S, Hh, Dh).transpose(1, 2)
+            attn_mask = valid_active.view(n_active, 1, 1, S).expand(n_active, 1, S, S)
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(n_active, S, D)
+            attn_tokens = token_chunks + self.out_proj(attn_out)
+            update = self.mlp(self.norm_mlp(attn_tokens))
+
+            image_token = valid_active & (type_active == 0) & (image_dst_active >= 0)
+            if not bool(image_token.any().item()):
+                continue
+            dst = image_dst_active[image_token]
+            upd = update[image_token] * alpha
+            h_idx = dst // W_t
+            w_idx = dst % W_t
+            out[frame_idx, h_idx, w_idx] = out[frame_idx, h_idx, w_idx] + upd
+
+        return out
+
+
 # ============================================================================
 # Top-level fusion module
 # ============================================================================
 
 
 class LidarImageFusionModule(nn.Module):
-    """VFE + projection + two windowed fusion layers (W-MSA + SW-MSA).
+    """VFE + 2D windowed fusion, optionally followed by 3D sorted fusion.
 
-    Designed to sit between OccAny's encoder and decoder. Input/output ``x``
-    has shape (B, N, n_patches, D_enc).
+    Input/output ``t_rec`` has shape (B, N, H_t, W_t, D). The optional 3D
+    stage reuses the same VFE voxel features and local-camera voxel centers.
     """
 
     def __init__(
@@ -592,6 +860,12 @@ class LidarImageFusionModule(nn.Module):
         pe_num_freqs: int = 8,
         ffn_ratio: float = 2.0,
         attn_type: str = "cross",
+        fusion3d_enabled: bool = False,
+        fusion3d_seq_len: int = 80,
+        fusion3d_num_heads: Optional[int] = None,
+        fusion3d_ffn_ratio: float = 2.0,
+        fusion3d_alpha_init: float = 0.0,
+        fusion3d_conf_clamp_max: float = 50.0,
     ) -> None:
         super().__init__()
         if attn_type not in ("cross", "self"):
@@ -619,6 +893,22 @@ class LidarImageFusionModule(nn.Module):
         self.layer_sw = layer_cls(
             d_model=d_model, num_heads=num_heads, window=window, shift=window // 2,
             H_t=H_t, W_t=W_t, ffn_ratio=ffn_ratio,
+        )
+        self.fusion3d = (
+            Sorted3DTokenFusionLayer(
+                d_model=d_model,
+                num_heads=num_heads if fusion3d_num_heads is None else fusion3d_num_heads,
+                seq_len=fusion3d_seq_len,
+                patch_size=patch_size,
+                vox_origin=vox_origin,
+                vox_size=vox_size,
+                vox_grid=vox_grid,
+                ffn_ratio=fusion3d_ffn_ratio,
+                conf_clamp_max=fusion3d_conf_clamp_max,
+                alpha_init=fusion3d_alpha_init,
+            )
+            if fusion3d_enabled
+            else None
         )
 
     def _project_voxels_to_patches(
@@ -664,6 +954,8 @@ class LidarImageFusionModule(nn.Module):
         T_cam_from_velo: torch.Tensor,                # (B, 4, 4)
         K_per_frame: torch.Tensor,                    # (B, N, 3, 3)
         image_hw: torch.Tensor,                       # (B, 2) (H, W)
+        p_rec_local: Optional[torch.Tensor] = None,   # (B, N, H_p, W_p, 3)
+        c_rec: Optional[torch.Tensor] = None,         # (B, N, H_p, W_p)
     ) -> torch.Tensor:
         B, N, H_t, W_t, D = t_rec.shape
         if (H_t, W_t) != (self.H_t, self.W_t):
@@ -711,12 +1003,14 @@ class LidarImageFusionModule(nn.Module):
                 # behavior is identity.
                 return t_rec
             voxel_feat_cat = image_feat.new_zeros((0, D))
+            voxel_center_cat = image_feat.new_zeros((0, 3))
             voxel_frame_idx_cat = torch.zeros((0,), dtype=torch.long, device=device)
             voxel_h_t_cat = torch.zeros((0,), dtype=torch.long, device=device)
             voxel_w_t_cat = torch.zeros((0,), dtype=torch.long, device=device)
             voxel_valid_cat = torch.zeros((0,), dtype=torch.bool, device=device)
         else:
             voxel_feat_cat = torch.cat(all_voxel_feats, dim=0)
+            voxel_center_cat = torch.cat(all_voxel_centers, dim=0)
             voxel_frame_idx_cat = torch.cat(all_voxel_frame_idx, dim=0)
             voxel_h_t_cat = torch.cat(all_voxel_h_t, dim=0)
             voxel_w_t_cat = torch.cat(all_voxel_w_t, dim=0)
@@ -743,6 +1037,20 @@ class LidarImageFusionModule(nn.Module):
             voxel_valid_cat,
         )
 
+        if self.fusion3d is not None:
+            if p_rec_local is None or c_rec is None:
+                raise RuntimeError(
+                    "3D fusion is enabled, but local pointmap/confidence was not provided."
+                )
+            image_feat = self.fusion3d(
+                image_feat=image_feat,
+                p_rec_local=p_rec_local,
+                c_rec=c_rec,
+                voxel_feat=voxel_feat_cat,
+                voxel_center_cam=voxel_center_cat,
+                voxel_frame_idx=voxel_frame_idx_cat,
+            )
+
         return image_feat.view(B, N, self.H_t, self.W_t, D)
 
 
@@ -750,5 +1058,6 @@ __all__ = [
     "VoxelFeatureEncoder",
     "WindowedCrossAttnLayer",
     "WindowedSelfAttnLayer",
+    "Sorted3DTokenFusionLayer",
     "LidarImageFusionModule",
 ]

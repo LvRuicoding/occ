@@ -200,11 +200,15 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         t_rec = dense.view(B, nimgs, H_t, W_t, D).contiguous()
 
         p_rec_global = post["pts3d"].float().detach()       # (B, nimgs, H_p, W_p, 3)
+        p_rec_local = post.get("pts3d_local", None)
+        if p_rec_local is not None:
+            p_rec_local = p_rec_local.float().detach()      # (B, nimgs, H_p, W_p, 3)
         c_rec = post["conf"].float().detach()               # (B, nimgs, H_p, W_p)
 
         return dict(
             t_rec=t_rec.detach(),
             p_rec_global=p_rec_global,
+            p_rec_local=p_rec_local,
             c_rec=c_rec,
         )
 

@@ -4,9 +4,11 @@ Same as ``Stage1SSCMonoModel`` except that the (frozen) OccAny reconstruction
 backbone's ``t_rec`` patch tokens are passed through a LiDAR-image fusion block
 before being handed to the lifting module. The default fusion interaction is
 windowed image+voxel self-attention; the original cross-attention path remains
-available via ``fusion_attn_type="cross"``. The OccAny encoder and decoder stay
-fully frozen and remain inside ``@torch.no_grad()``; only the fusion module,
-lifting, and occ_head are trained.
+available via ``fusion_attn_type="cross"``. An optional second fusion stage
+(``fusion3d_enabled=True``) applies fixed-length 3D-sorted self-attention over
+image and voxel tokens using local pointmaps. The OccAny encoder and decoder
+stay fully frozen and remain inside ``@torch.no_grad()``; only fusion, lifting,
+and occ_head are trained.
 
 Forward signature adds the LiDAR/calib inputs produced by
 ``Kitti5FrameStage1MonoLidarDataset`` + ``collate_stage1_mono_lidar``.
@@ -52,6 +54,11 @@ class Stage1SSCMonoLidarModel(nn.Module):
         fusion_d_voxel: int = 128,
         fusion_pe_num_freqs: int = 8,
         fusion_attn_type: str = "self",
+        fusion3d_enabled: bool = False,
+        fusion3d_seq_len: int = 80,
+        fusion3d_num_heads: Optional[int] = None,
+        fusion3d_ffn_ratio: float = 2.0,
+        fusion3d_alpha_init: float = 0.0,
     ) -> None:
         super().__init__()
         if c_lift != 64:
@@ -83,6 +90,11 @@ class Stage1SSCMonoLidarModel(nn.Module):
             vfe_d_voxel=fusion_d_voxel,
             pe_num_freqs=fusion_pe_num_freqs,
             attn_type=fusion_attn_type,
+            fusion3d_enabled=fusion3d_enabled,
+            fusion3d_seq_len=fusion3d_seq_len,
+            fusion3d_num_heads=fusion3d_num_heads,
+            fusion3d_ffn_ratio=fusion3d_ffn_ratio,
+            fusion3d_alpha_init=fusion3d_alpha_init,
         )
 
         self.lifting = Stage1LiftingModule(
@@ -126,6 +138,8 @@ class Stage1SSCMonoLidarModel(nn.Module):
             T_cam_from_velo=T_cam_from_velo,
             K_per_frame=K_per_frame,
             image_hw=image_hw,
+            p_rec_local=backbone_out.get("p_rec_local"),
+            c_rec=backbone_out["c_rec"],
         )
         V_rec, W_rec = self.lifting(
             t_rec=t_rec_fused,

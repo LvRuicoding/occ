@@ -61,6 +61,11 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--occany_ckpt", default=None, type=str)
     p.add_argument("--velodyne_root", default=None, type=str)
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default=None)
+    p.add_argument("--fusion3d", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--fusion3d_seq_len", type=int, default=None)
+    p.add_argument("--fusion3d_num_heads", type=int, default=None)
+    p.add_argument("--fusion3d_ffn_ratio", type=float, default=None)
+    p.add_argument("--fusion3d_alpha_init", type=float, default=None)
     p.add_argument("--max_points_per_sweep", type=int, default=None)
 
     p.add_argument("--width", type=int, default=None)
@@ -120,6 +125,21 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args: Dict) -> Non
     args.fusion_attn_type = _override_or_ckpt(
         args, ckpt_args, "fusion_attn_type", "self"
     )
+    args.fusion3d = bool(_override_or_ckpt(args, ckpt_args, "fusion3d", False))
+    args.fusion3d_seq_len = int(
+        _override_or_ckpt(args, ckpt_args, "fusion3d_seq_len", 80)
+    )
+    args.fusion3d_num_heads = _override_or_ckpt(
+        args, ckpt_args, "fusion3d_num_heads", None
+    )
+    if args.fusion3d_num_heads is not None:
+        args.fusion3d_num_heads = int(args.fusion3d_num_heads)
+    args.fusion3d_ffn_ratio = float(
+        _override_or_ckpt(args, ckpt_args, "fusion3d_ffn_ratio", 2.0)
+    )
+    args.fusion3d_alpha_init = float(
+        _override_or_ckpt(args, ckpt_args, "fusion3d_alpha_init", 0.0)
+    )
     args.max_points_per_sweep = int(
         _override_or_ckpt(args, ckpt_args, "max_points_per_sweep", 0)
     )
@@ -167,6 +187,11 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     )
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
+        model_kwargs["fusion3d_enabled"] = args.fusion3d
+        model_kwargs["fusion3d_seq_len"] = args.fusion3d_seq_len
+        model_kwargs["fusion3d_num_heads"] = args.fusion3d_num_heads
+        model_kwargs["fusion3d_ffn_ratio"] = args.fusion3d_ffn_ratio
+        model_kwargs["fusion3d_alpha_init"] = args.fusion3d_alpha_init
     model = model_cls(**model_kwargs).to(device)
     for p in model.backbone.parameters():
         p.requires_grad = False

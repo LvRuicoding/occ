@@ -5,6 +5,7 @@ from .stage1_ssc import Stage1SSCModel
 from .stage1_ssc_mono import Stage1SSCMonoModel
 from .lidar_fusion import (
     LidarImageFusionModule,
+    Sorted3DTokenFusionLayer,
     VoxelFeatureEncoder,
     WindowedCrossAttnLayer,
     WindowedSelfAttnLayer,
@@ -18,6 +19,7 @@ __all__ = [
     "Stage1SSCMonoModel",
     "Stage1SSCMonoLidarModel",
     "LidarImageFusionModule",
+    "Sorted3DTokenFusionLayer",
     "VoxelFeatureEncoder",
     "WindowedCrossAttnLayer",
     "WindowedSelfAttnLayer",

@@ -122,6 +122,16 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
                         "'self' uses image+voxel window self-attention; 'cross' "
                         "keeps the original image-query/voxel-KV cross-attention.")
+    p.add_argument("--fusion3d", action="store_true",
+                   help="Enable the extra 3D sorted image/voxel self-attention "
+                        "fusion after the 2D LiDAR/image fusion block.")
+    p.add_argument("--fusion3d_seq_len", type=int, default=80,
+                   help="Fixed chunk length for --fusion3d sorted self-attention.")
+    p.add_argument("--fusion3d_num_heads", type=int, default=None,
+                   help="Attention heads for --fusion3d. Defaults to the 2D fusion head count.")
+    p.add_argument("--fusion3d_ffn_ratio", type=float, default=2.0)
+    p.add_argument("--fusion3d_alpha_init", type=float, default=0.0,
+                   help="Initial residual gate value for --fusion3d.")
     # Whether to convert BatchNorm layers to SyncBatchNorm under DDP. "auto"
     # (default) turns it on for the monoscene head (which is BN-heavy and
     # otherwise broken at per-GPU bs=1) and leaves the light head alone (it
@@ -487,16 +497,26 @@ def main():
     )
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
+        model_kwargs["fusion3d_enabled"] = args.fusion3d
+        model_kwargs["fusion3d_seq_len"] = args.fusion3d_seq_len
+        model_kwargs["fusion3d_num_heads"] = args.fusion3d_num_heads
+        model_kwargs["fusion3d_ffn_ratio"] = args.fusion3d_ffn_ratio
+        model_kwargs["fusion3d_alpha_init"] = args.fusion3d_alpha_init
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")
+        print(
+            f"[fusion3d] enabled={args.fusion3d} "
+            f"seq_len={args.fusion3d_seq_len} alpha_init={args.fusion3d_alpha_init}"
+        )
 
     # Freeze the OccAny backbone in every variant (light / monoscene /
     # monoscene_lidar). Trainable params:
     #   light:            lifting + occ_head
     #   monoscene:        lifting + occ_head (incl. monoscene adapter)
-    #   monoscene_lidar:  lifting + occ_head + fusion (VFE + W-MSA/SW-MSA)
+    #   monoscene_lidar:  lifting + occ_head + fusion
+    #                      (+ optional sorted-3D self-attention)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
