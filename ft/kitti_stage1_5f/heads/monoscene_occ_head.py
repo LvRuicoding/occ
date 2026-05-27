@@ -1,6 +1,7 @@
 """MonoScene-style occupancy head: adapter + vendored UNet3D(kitti, context_prior=True).
 
-Input:  (B, 65, 256, 256, 32)  -- lifted volume from Stage1LiftingModule.
+Input:  (B, 65+extra, 256, 256, 32)  -- lifted volume from Stage1LiftingModule,
+        optionally followed by extra dense 3D fusion channels.
 Output: dict with keys
    - "ssc_logit": (B, num_classes, 256, 256, 32)
    - "P_logits":  (B, n_relations, flatten_context_size, flatten_size)
@@ -26,9 +27,13 @@ class MonoSceneOccHead(nn.Module):
         context_prior: bool = True,
         bn_momentum: float = 0.1,
         adapter_refine: bool = True,
+        adapter_extra_channels: int = 0,
     ) -> None:
         super().__init__()
-        self.adapter = MonoSceneFeatureAdapter(refine=adapter_refine)
+        self.adapter = MonoSceneFeatureAdapter(
+            refine=adapter_refine,
+            extra_channels=adapter_extra_channels,
+        )
         self.unet3d = UNet3D(
             class_num=num_classes,
             norm_layer=nn.BatchNorm3d,

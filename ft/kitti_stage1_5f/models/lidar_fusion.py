@@ -57,6 +57,7 @@ class VoxelFeatureEncoder(nn.Module):
         d_out: int = 768,
         hidden: int = 64,
         pe_num_freqs: int = 8,
+        point_mlp: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.register_buffer(
@@ -67,13 +68,17 @@ class VoxelFeatureEncoder(nn.Module):
         )
         self.vox_grid: Tuple[int, int, int] = tuple(int(v) for v in vox_grid)
 
-        # Per-point input features: (x, y, z, intensity, dx_c, dy_c, dz_c) = 7
-        self.point_mlp = nn.Sequential(
-            nn.Linear(7, hidden),
-            nn.LayerNorm(hidden),
-            nn.GELU(),
-            nn.Linear(hidden, d_voxel),
-        )
+        # Per-point input features: (x, y, z, intensity, dx_c, dy_c, dz_c) = 7.
+        # If a shared module is provided it must output d_voxel-dim features.
+        if point_mlp is not None:
+            self.point_mlp = point_mlp
+        else:
+            self.point_mlp = nn.Sequential(
+                nn.Linear(7, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, d_voxel),
+            )
         self.voxel_norm = nn.LayerNorm(d_voxel)
         self.voxel_proj = nn.Linear(d_voxel, d_out)
 
@@ -833,6 +838,290 @@ class Sorted3DTokenFusionLayer(nn.Module):
 
 
 # ============================================================================
+# Dense target-grid VFE for post-lift 3D fusion
+# ============================================================================
+
+
+class TargetGridLidarFeatureEncoder(nn.Module):
+    """Aggregate multi-frame LiDAR into the target/velo voxel grid.
+
+    All sweeps are transformed into the target frame's velodyne system, a
+    per-point frame embedding is added after the shared point MLP, and a single
+    per-voxel max-pool is run across the union of all points. The output is the
+    learned feature volume plus three diagnostic channels per voxel:
+      - ``mask``      : 1 where any sweep deposited a point.
+      - ``count``     : ``log1p`` saturating point-density in [0,1].
+      - ``diversity`` : (number of distinct contributing frames) / N in [0,1].
+
+    ``diversity`` separates stable multi-sweep occupancy from single-frame
+    ghosting caused by dynamic objects.
+    """
+
+    def __init__(
+        self,
+        vox_origin: Tuple[float, float, float] = (0.0, -25.6, -2.0),
+        base_vox_size: Tuple[float, float, float] = (0.4, 0.4, 0.4),
+        base_grid: Tuple[int, int, int] = (128, 128, 16),
+        full_grid: Tuple[int, int, int] = (256, 256, 32),
+        d_voxel: int = 128,
+        d_out: int = 32,
+        hidden: int = 64,
+        pe_num_freqs: int = 8,
+        num_frames: int = 5,
+        point_mlp: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "vox_origin", torch.tensor(vox_origin, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "base_vox_size", torch.tensor(base_vox_size, dtype=torch.float32), persistent=False
+        )
+        self.base_grid: Tuple[int, int, int] = tuple(int(v) for v in base_grid)
+        self.full_grid: Tuple[int, int, int] = tuple(int(v) for v in full_grid)
+        self.d_out = int(d_out)
+        self.d_voxel = int(d_voxel)
+        if self.d_out <= 0:
+            raise ValueError(f"d_out must be positive, got {d_out}")
+        if int(num_frames) <= 0:
+            raise ValueError(f"num_frames must be positive, got {num_frames}")
+        self.num_frames = int(num_frames)
+
+        if point_mlp is not None:
+            self.point_mlp = point_mlp
+        else:
+            self.point_mlp = nn.Sequential(
+                nn.Linear(7, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, d_voxel),
+            )
+        # Per-point frame embedding added post-MLP so the shared point_mlp can
+        # stay temporally agnostic (used as-is by the cam-frame VFE).
+        self.time_embed = nn.Embedding(self.num_frames, self.d_voxel)
+        nn.init.zeros_(self.time_embed.weight)
+
+        self.voxel_norm = nn.LayerNorm(d_voxel)
+        self.voxel_proj = nn.Linear(d_voxel, d_out)
+
+        self.pe_num_freqs = int(pe_num_freqs)
+        pe_dim = 3 * 2 * self.pe_num_freqs
+        self.pe_proj = nn.Linear(pe_dim, d_out)
+
+    def _transform_to_target(
+        self,
+        points_velo: torch.Tensor,
+        T_target_from_frame_velo: torch.Tensor,
+    ) -> torch.Tensor:
+        T = T_target_from_frame_velo.to(dtype=torch.float32)
+        p_velo = points_velo[:, :3].to(dtype=torch.float32)
+        R = T[:3, :3]
+        t = T[:3, 3]
+        return p_velo @ R.T + t
+
+    def _upsample_to_full(
+        self,
+        feat: torch.Tensor,
+        mask: torch.Tensor,
+        count: torch.Tensor,
+        diversity: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.base_grid == self.full_grid:
+            return feat, mask, count, diversity
+        # Trilinear is fp32-only on some backends; cast then back to be safe.
+        feat_f32 = feat.to(dtype=torch.float32)
+        feat_f32 = F.interpolate(
+            feat_f32, size=self.full_grid, mode="trilinear", align_corners=False
+        )
+        feat = feat_f32.to(dtype=feat.dtype)
+        mask = F.interpolate(mask, size=self.full_grid, mode="nearest")
+        count = F.interpolate(count, size=self.full_grid, mode="nearest")
+        diversity = F.interpolate(diversity, size=self.full_grid, mode="nearest")
+        return feat, mask, count, diversity
+
+    def forward(
+        self,
+        points_per_frame: List[List[torch.Tensor]],   # [B][N] (P, 4), frame-velo coords
+        T_cam_from_velo: torch.Tensor,                # (B, 4, 4)
+        T_target_from_refcam: torch.Tensor,           # (B, 4, 4), target-velo <- target-cam
+        cam2world_per_frame: torch.Tensor,            # (B, N, 4, 4), world <- cam_f
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = len(points_per_frame)
+        if B == 0:
+            raise RuntimeError("points_per_frame must contain at least one sample.")
+        N = len(points_per_frame[0])
+        if cam2world_per_frame.shape[:2] != (B, N):
+            raise RuntimeError(
+                f"cam2world shape {tuple(cam2world_per_frame.shape[:2])} "
+                f"does not match points_per_frame ({B}, {N})."
+            )
+        if N > self.num_frames:
+            raise RuntimeError(
+                f"input has {N} frames but encoder was built with "
+                f"num_frames={self.num_frames}."
+            )
+
+        device = T_cam_from_velo.device
+        out_dtype = output_dtype if output_dtype is not None else T_cam_from_velo.dtype
+        Gx, Gy, Gz = self.base_grid
+        n_base_voxels = B * Gx * Gy * Gz
+
+        vox_origin = self.vox_origin.to(device=device, dtype=torch.float32)
+        vox_size = self.base_vox_size.to(device=device, dtype=torch.float32)
+        cam2world = cam2world_per_frame.to(device=device, dtype=torch.float32)
+
+        # Accumulate per-point features across all (b, f) before a single
+        # batch-wide max-pool. Each entry holds post-MLP + time-embedded
+        # features so the pool keeps "winning point" semantics rather than
+        # being diluted by an outer mean across sweeps.
+        all_h: List[torch.Tensor] = []
+        all_lin: List[torch.Tensor] = []
+        all_frame: List[torch.Tensor] = []
+
+        for b in range(B):
+            T_cv = T_cam_from_velo[b].to(device=device, dtype=torch.float32)
+            T_target_from_cam = T_target_from_refcam[b].to(device=device, dtype=torch.float32)
+            T_cam_target_from_world = torch.linalg.inv(cam2world[b, 0])
+
+            for f in range(N):
+                pts = points_per_frame[b][f]
+                if pts.shape[0] == 0:
+                    continue
+                pts = pts.to(device=device, non_blocking=True)
+
+                T_target_from_frame_velo = (
+                    T_target_from_cam
+                    @ T_cam_target_from_world
+                    @ cam2world[b, f]
+                    @ T_cv
+                )
+                p_target = self._transform_to_target(pts, T_target_from_frame_velo)
+                intensity = pts[:, 3:4].to(dtype=torch.float32)
+
+                idx_f = (p_target - vox_origin) / vox_size
+                idx = idx_f.floor().long()
+                valid = (
+                    torch.isfinite(p_target).all(dim=-1)
+                    & torch.isfinite(intensity).flatten()
+                    & (idx[:, 0] >= 0) & (idx[:, 0] < Gx)
+                    & (idx[:, 1] >= 0) & (idx[:, 1] < Gy)
+                    & (idx[:, 2] >= 0) & (idx[:, 2] < Gz)
+                )
+                if not bool(valid.any().item()):
+                    continue
+
+                idx = idx[valid]
+                p_valid = p_target[valid]
+                i_valid = intensity[valid]
+                voxel_center = (idx.to(p_valid.dtype) + 0.5) * vox_size + vox_origin
+                rel = p_valid - voxel_center
+                point_feat = torch.cat([p_valid, i_valid, rel], dim=-1)  # (P, 7)
+
+                h = self.point_mlp(point_feat)  # (P, d_voxel)
+                P_valid = h.shape[0]
+                frame_ids = torch.full(
+                    (P_valid,), int(f), dtype=torch.long, device=device
+                )
+                h = h + self.time_embed(frame_ids).to(dtype=h.dtype)
+
+                lin = (((b * Gx + idx[:, 0]) * Gy + idx[:, 1]) * Gz + idx[:, 2])
+                all_h.append(h)
+                all_lin.append(lin)
+                all_frame.append(frame_ids)
+
+        if len(all_h) == 0:
+            feat = torch.zeros((B, self.d_out, Gx, Gy, Gz), device=device, dtype=out_dtype)
+            mask = torch.zeros((B, 1, Gx, Gy, Gz), device=device, dtype=out_dtype)
+            count = torch.zeros((B, 1, Gx, Gy, Gz), device=device, dtype=out_dtype)
+            diversity = torch.zeros((B, 1, Gx, Gy, Gz), device=device, dtype=out_dtype)
+            return self._upsample_to_full(feat, mask, count, diversity)
+
+        h_cat = torch.cat(all_h, dim=0)
+        lin_cat = torch.cat(all_lin, dim=0)
+        frame_cat = torch.cat(all_frame, dim=0)
+
+        # Single per-voxel max-pool across the union of all points.
+        uniq_lin, inverse = torch.unique(lin_cat, return_inverse=True)
+        U = int(uniq_lin.shape[0])
+        d_voxel = h_cat.shape[-1]
+        neg_inf = torch.finfo(h_cat.dtype).min
+        voxel_feat = torch.full((U, d_voxel), neg_inf, dtype=h_cat.dtype, device=device)
+        voxel_feat.scatter_reduce_(
+            0,
+            inverse.unsqueeze(-1).expand(-1, d_voxel),
+            h_cat,
+            reduce="amax",
+            include_self=False,
+        )
+        voxel_feat = voxel_feat.masked_fill(voxel_feat == neg_inf, 0.0)
+
+        voxel_feat = self.voxel_norm(voxel_feat)
+        voxel_proj = self.voxel_proj(voxel_feat)
+
+        local_lin = uniq_lin % (Gx * Gy * Gz)
+        u_x = local_lin // (Gy * Gz)
+        u_y = (local_lin // Gz) % Gy
+        u_z = local_lin % Gz
+        uniq_idx = torch.stack([u_x, u_y, u_z], dim=-1).to(dtype=torch.float32)
+        voxel_center = (uniq_idx + 0.5) * vox_size + vox_origin
+        pe = VoxelFeatureEncoder._sinusoidal_pe_3d(
+            voxel_center, self.pe_num_freqs
+        ).to(voxel_proj.dtype)
+        voxel_proj = voxel_proj + self.pe_proj(pe)
+
+        # Point density per voxel (log1p saturates so a few-hundred dense
+        # voxels don't dwarf single-hit ones).
+        point_count = torch.zeros((U,), dtype=torch.float32, device=device)
+        point_count.index_add_(
+            0, inverse, torch.ones_like(inverse, dtype=torch.float32)
+        )
+        count_norm = (torch.log1p(point_count) / math.log1p(64.0)).clamp_(0.0, 1.0)
+
+        # Frame diversity = distinct contributing frames per voxel. Encode
+        # (voxel, frame) pairs as a single int and unique them — the resulting
+        # count per voxel is the diversity.
+        pair = lin_cat * self.num_frames + frame_cat
+        uniq_pair = torch.unique(pair)
+        pair_lin = uniq_pair // self.num_frames
+        # uniq_lin is sorted, so searchsorted yields the per-pair voxel id.
+        pair_vox_idx = torch.searchsorted(uniq_lin, pair_lin)
+        diversity = torch.zeros((U,), dtype=torch.float32, device=device)
+        diversity.index_add_(
+            0,
+            pair_vox_idx,
+            torch.ones_like(pair_vox_idx, dtype=torch.float32),
+        )
+        diversity_norm = (diversity / float(max(N, 1))).clamp_(0.0, 1.0)
+
+        dense_feat = torch.zeros(
+            (n_base_voxels, self.d_out), dtype=voxel_proj.dtype, device=device
+        )
+        dense_feat[uniq_lin] = voxel_proj
+        mask_flat = torch.zeros((n_base_voxels, 1), dtype=voxel_proj.dtype, device=device)
+        mask_flat[uniq_lin] = 1.0
+        count_flat = torch.zeros((n_base_voxels, 1), dtype=voxel_proj.dtype, device=device)
+        count_flat[uniq_lin] = count_norm.unsqueeze(-1).to(dtype=voxel_proj.dtype)
+        div_flat = torch.zeros((n_base_voxels, 1), dtype=voxel_proj.dtype, device=device)
+        div_flat[uniq_lin] = diversity_norm.unsqueeze(-1).to(dtype=voxel_proj.dtype)
+
+        feat = dense_feat.view(B, Gx, Gy, Gz, self.d_out).permute(0, 4, 1, 2, 3).contiguous()
+        mask = mask_flat.view(B, Gx, Gy, Gz, 1).permute(0, 4, 1, 2, 3).contiguous()
+        count = count_flat.view(B, Gx, Gy, Gz, 1).permute(0, 4, 1, 2, 3).contiguous()
+        diversity = div_flat.view(B, Gx, Gy, Gz, 1).permute(0, 4, 1, 2, 3).contiguous()
+
+        feat, mask, count, diversity = self._upsample_to_full(
+            feat, mask, count, diversity
+        )
+        return (
+            feat.to(dtype=out_dtype),
+            mask.to(dtype=out_dtype),
+            count.to(dtype=out_dtype),
+            diversity.to(dtype=out_dtype),
+        )
+
+
+# ============================================================================
 # Top-level fusion module
 # ============================================================================
 
@@ -866,6 +1155,7 @@ class LidarImageFusionModule(nn.Module):
         fusion3d_ffn_ratio: float = 2.0,
         fusion3d_alpha_init: float = 0.0,
         fusion3d_conf_clamp_max: float = 50.0,
+        vfe_point_mlp: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         if attn_type not in ("cross", "self"):
@@ -884,6 +1174,7 @@ class LidarImageFusionModule(nn.Module):
             d_out=d_model,
             hidden=vfe_hidden,
             pe_num_freqs=pe_num_freqs,
+            point_mlp=vfe_point_mlp,
         )
         layer_cls = WindowedSelfAttnLayer if attn_type == "self" else WindowedCrossAttnLayer
         self.layer_w = layer_cls(
@@ -1056,6 +1347,7 @@ class LidarImageFusionModule(nn.Module):
 
 __all__ = [
     "VoxelFeatureEncoder",
+    "TargetGridLidarFeatureEncoder",
     "WindowedCrossAttnLayer",
     "WindowedSelfAttnLayer",
     "Sorted3DTokenFusionLayer",

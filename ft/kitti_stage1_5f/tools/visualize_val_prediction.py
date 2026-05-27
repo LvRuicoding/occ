@@ -29,8 +29,16 @@ from occany.metrics.ssc import SSCMetrics
 from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
 from occany.utils.image_util import convert_images_to_uint8_hwc
 
-from ..datasets import KITTI_SSC_CLASS_NAMES, Kitti5FrameStage1Dataset, collate_stage1
-from ..models import Stage1SSCModel
+from ..datasets import (
+    KITTI_SSC_CLASS_NAMES,
+    Kitti5FrameStage1Dataset,
+    Kitti5FrameStage1MonoDataset,
+    Kitti5FrameStage1MonoLidarDataset,
+    collate_stage1,
+    collate_stage1_mono,
+    collate_stage1_mono_lidar,
+)
+from ..models import Stage1SSCModel, Stage1SSCMonoLidarModel, Stage1SSCMonoModel
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -39,6 +47,7 @@ DEFAULT_PROCESSED_ROOT = REPO_ROOT / "data" / "kitti_processed"
 DEFAULT_KITTIODO_ROOT = REPO_ROOT / "raw_data" / "semantickitti_occany_root"
 DEFAULT_FALLBACK_KITTIODO_ROOT = REPO_ROOT / "raw_data" / "OpenDataLab___KITTI_Odometry_2012"
 DEFAULT_OCCANY_CKPT = REPO_ROOT / "checkpoints" / "occany_recon.pth"
+DEFAULT_VELODYNE_ROOT = REPO_ROOT / "data" / "kitti"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "visuals" / "kitti_stage1_val_prediction_compare"
 MAJOR_CLASS_NAMES = ("road", "sidewalk", "building", "vegetation", "terrain", "car")
 MAJOR_CLASS_IDS = tuple(KITTI_SSC_CLASS_NAMES.index(name) for name in MAJOR_CLASS_NAMES)
@@ -83,6 +92,20 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--kittiodo_root", default=None, type=str)
     p.add_argument("--occany_ckpt", default=None, type=str,
                    help="Original OccAny reconstruction checkpoint. Defaults to checkpoint args.")
+    p.add_argument("--model_type", "--exp", dest="exp",
+                   choices=["light", "monoscene", "monoscene_lidar"], default=None,
+                   help="Model variant. If omitted, read from checkpoint args.")
+    p.add_argument("--velodyne_root", default=None, type=str,
+                   help="Raw KITTI Odometry root for monoscene_lidar checkpoints.")
+    p.add_argument("--max_points_per_sweep", default=None, type=int)
+    p.add_argument("--fusion_attn_type", choices=["self", "cross"], default=None)
+    p.add_argument("--fusion3d", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--fusion3d_seq_len", type=int, default=None)
+    p.add_argument("--fusion3d_num_heads", type=int, default=None)
+    p.add_argument("--fusion3d_ffn_ratio", type=float, default=None)
+    p.add_argument("--fusion3d_alpha_init", type=float, default=None)
+    p.add_argument("--post_lift_lidar", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--post_lift_lidar_channels", type=int, default=None)
     p.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
     p.add_argument("--max_voxels_plot", default=60000, type=int)
     p.add_argument("--elev", default=22.0, type=float)
@@ -100,6 +123,34 @@ def resolve_device(device_arg: str) -> torch.device:
 
 def ckpt_arg(ckpt_args: Dict, name: str, default):
     return ckpt_args.get(name, default) if isinstance(ckpt_args, dict) else default
+
+
+def override_or_ckpt(args: argparse.Namespace, ckpt_args: Dict, name: str, default):
+    value = getattr(args, name)
+    return value if value is not None else ckpt_arg(ckpt_args, name, default)
+
+
+def infer_exp(args: argparse.Namespace, ckpt: Dict, ckpt_args: Dict) -> str:
+    if args.exp is not None:
+        return args.exp
+    exp = ckpt_arg(ckpt_args, "exp", None)
+    if exp in {"light", "monoscene", "monoscene_lidar"}:
+        return str(exp)
+    if "fusion" in ckpt:
+        return "monoscene_lidar"
+    occ_keys = ckpt.get("occ_head", {}).keys()
+    if any(str(k).startswith("unet3d.") for k in occ_keys):
+        return "monoscene"
+    return "light"
+
+
+def move_points_to_device(
+    points_per_frame: List[List[torch.Tensor]], device: torch.device
+) -> List[List[torch.Tensor]]:
+    return [
+        [pts.to(device, non_blocking=True) for pts in per_sample]
+        for per_sample in points_per_frame
+    ]
 
 
 def calib_root_has_tr(root: Path) -> bool:
@@ -414,8 +465,9 @@ def build_model(
     ckpt: Dict,
     ckpt_args: Dict,
     occany_ckpt: str,
+    exp: str,
     device: torch.device,
-) -> Stage1SSCModel:
+) -> torch.nn.Module:
     amp = ckpt_arg(ckpt_args, "amp", "bf16")
     if device.type != "cuda":
         backbone_dtype = torch.float32
@@ -426,7 +478,14 @@ def build_model(
     else:
         backbone_dtype = torch.bfloat16
 
-    model = Stage1SSCModel(
+    if exp == "monoscene_lidar":
+        model_cls = Stage1SSCMonoLidarModel
+    elif exp == "monoscene":
+        model_cls = Stage1SSCMonoModel
+    else:
+        model_cls = Stage1SSCModel
+
+    model_kwargs = dict(
         occany_ckpt=occany_ckpt,
         c_lift=int(ckpt_arg(ckpt_args, "c_lift", 64)),
         num_classes=20,
@@ -437,11 +496,97 @@ def build_model(
             int(ckpt_arg(ckpt_args, "width", 512)),
         ),
         backbone_dtype=backbone_dtype,
-    ).to(device)
+    )
+    if exp == "monoscene_lidar":
+        model_kwargs["fusion_attn_type"] = ckpt_arg(ckpt_args, "fusion_attn_type", "self")
+        model_kwargs["fusion3d_enabled"] = bool(ckpt_arg(ckpt_args, "fusion3d", False))
+        model_kwargs["fusion3d_seq_len"] = int(ckpt_arg(ckpt_args, "fusion3d_seq_len", 80))
+        fusion3d_num_heads = ckpt_arg(ckpt_args, "fusion3d_num_heads", None)
+        model_kwargs["fusion3d_num_heads"] = (
+            int(fusion3d_num_heads) if fusion3d_num_heads is not None else None
+        )
+        model_kwargs["fusion3d_ffn_ratio"] = float(
+            ckpt_arg(ckpt_args, "fusion3d_ffn_ratio", 2.0)
+        )
+        model_kwargs["fusion3d_alpha_init"] = float(
+            ckpt_arg(ckpt_args, "fusion3d_alpha_init", 0.0)
+        )
+        model_kwargs["post_lift_lidar_enabled"] = bool(
+            ckpt_arg(ckpt_args, "post_lift_lidar", False)
+        )
+        model_kwargs["post_lift_lidar_channels"] = int(
+            ckpt_arg(ckpt_args, "post_lift_lidar_channels", 32)
+        )
+        model_kwargs["num_frames"] = int(ckpt_arg(ckpt_args, "num_frames", 5))
+
+    model = model_cls(**model_kwargs).to(device)
     model.lifting.load_state_dict(ckpt["lifting"], strict=True)
     model.occ_head.load_state_dict(ckpt["occ_head"], strict=True)
+    if exp == "monoscene_lidar":
+        if "fusion" not in ckpt:
+            raise KeyError("monoscene_lidar checkpoint must contain a 'fusion' state_dict.")
+        model.fusion.load_state_dict(ckpt["fusion"], strict=True)
+        if model.post_lift_lidar is not None:
+            model.post_lift_lidar.load_state_dict(ckpt["post_lift_lidar"], strict=True)
+            model.post_lift_fuse.load_state_dict(ckpt["post_lift_fuse"], strict=True)
     model.eval()
     return model
+
+
+def build_dataset(
+    exp: str,
+    processed_root: str,
+    kittiodo_root: str,
+    velodyne_root: str,
+    max_points_per_sweep: int,
+    width: int,
+    height: int,
+    num_frames: int,
+    frame_stride: int,
+):
+    common = dict(
+        processed_root=processed_root,
+        kittiodo_root=kittiodo_root,
+        split="val",
+        num_frames=num_frames,
+        frame_stride=frame_stride,
+        output_resolution=(width, height),
+        cam_idx=0,
+    )
+    if exp == "monoscene_lidar":
+        return Kitti5FrameStage1MonoLidarDataset(
+            velodyne_root=velodyne_root,
+            max_points_per_sweep=max_points_per_sweep,
+            **common,
+        )
+    if exp == "monoscene":
+        return Kitti5FrameStage1MonoDataset(**common)
+    return Kitti5FrameStage1Dataset(**common)
+
+
+def collate_for_exp(exp: str, samples):
+    if exp == "monoscene_lidar":
+        return collate_stage1_mono_lidar(samples)
+    if exp == "monoscene":
+        return collate_stage1_mono(samples)
+    return collate_stage1(samples)
+
+
+def run_model(model: torch.nn.Module, batch: Dict, exp: str, device: torch.device) -> torch.Tensor:
+    views = move_views_to_device(batch["views"], device)
+    T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
+    if exp == "monoscene_lidar":
+        out = model(
+            views,
+            T_target_from_refcam,
+            move_points_to_device(batch["points_per_frame"], device),
+            batch["T_cam_from_velo"].to(device, non_blocking=True),
+            batch["K_per_frame"].to(device, non_blocking=True),
+            batch["image_hw"].to(device, non_blocking=True),
+        )
+    else:
+        out = model(views, T_target_from_refcam)
+    return out["ssc_logit"] if isinstance(out, dict) else out
 
 
 @torch.no_grad()
@@ -455,21 +600,47 @@ def main() -> None:
         raise FileNotFoundError(f"Stage-1 checkpoint not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_args = ckpt.get("args", {})
+    ckpt_args = dict(ckpt_args) if isinstance(ckpt_args, dict) else {}
+    exp = infer_exp(args, ckpt, ckpt_args)
+    ckpt_args["exp"] = exp
+    for name in (
+        "fusion_attn_type",
+        "fusion3d",
+        "fusion3d_seq_len",
+        "fusion3d_num_heads",
+        "fusion3d_ffn_ratio",
+        "fusion3d_alpha_init",
+        "post_lift_lidar",
+        "post_lift_lidar_channels",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            ckpt_args[name] = value
     processed_root, kittiodo_root, occany_ckpt = resolve_paths(args, ckpt_args)
 
     width = int(ckpt_arg(ckpt_args, "width", 512))
     height = int(ckpt_arg(ckpt_args, "height", 160))
     num_frames = int(ckpt_arg(ckpt_args, "num_frames", 5))
     frame_stride = int(ckpt_arg(ckpt_args, "frame_stride", 1))
+    velodyne_root = args.velodyne_root or ckpt_arg(
+        ckpt_args, "velodyne_root", str(DEFAULT_VELODYNE_ROOT)
+    )
+    max_points_per_sweep = int(
+        override_or_ckpt(args, ckpt_args, "max_points_per_sweep", 0)
+    )
+    if exp == "monoscene_lidar" and not Path(velodyne_root).exists():
+        raise FileNotFoundError(f"velodyne_root does not exist: {velodyne_root}")
 
-    dataset = Kitti5FrameStage1Dataset(
+    dataset = build_dataset(
+        exp=exp,
         processed_root=processed_root,
         kittiodo_root=kittiodo_root,
-        split="val",
+        velodyne_root=velodyne_root,
+        max_points_per_sweep=max_points_per_sweep,
+        width=width,
+        height=height,
         num_frames=num_frames,
         frame_stride=frame_stride,
-        output_resolution=(width, height),
-        cam_idx=0,
     )
     if len(dataset) == 0:
         raise RuntimeError("Validation dataset is empty.")
@@ -482,15 +653,14 @@ def main() -> None:
         raise IndexError(f"sample_idx={sample_idx} out of range [0, {len(dataset) - 1}]")
 
     device = resolve_device(args.device)
-    model = build_model(ckpt, ckpt_args, occany_ckpt, device)
+    model = build_model(ckpt, ckpt_args, occany_ckpt, exp, device)
 
     sample = dataset[sample_idx]
-    batch = collate_stage1([sample])
+    batch = collate_for_exp(exp, [sample])
     views = move_views_to_device(batch["views"], device)
-    T_target_from_refcam = batch["T_target_from_refcam"].to(device)
     target = batch["voxel_label"].to(device)
 
-    logits = model(views, T_target_from_refcam)
+    logits = run_model(model, batch, exp, device)
     pred = logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
     gt = target[0].cpu().numpy().astype(np.uint8)
     summary = compute_summary(pred, gt)
@@ -560,8 +730,11 @@ def main() -> None:
     meta = {
         "stage1_ckpt": str(ckpt_path),
         "occany_ckpt": occany_ckpt,
+        "model_type": exp,
         "processed_root": processed_root,
         "kittiodo_root": kittiodo_root,
+        "velodyne_root": velodyne_root if exp == "monoscene_lidar" else None,
+        "max_points_per_sweep": max_points_per_sweep if exp == "monoscene_lidar" else None,
         "sample_idx": sample_idx,
         "sequence": seq,
         "target_frame_id": target_frame,

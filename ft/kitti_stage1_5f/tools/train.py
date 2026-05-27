@@ -132,6 +132,13 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--fusion3d_ffn_ratio", type=float, default=2.0)
     p.add_argument("--fusion3d_alpha_init", type=float, default=0.0,
                    help="Initial residual gate value for --fusion3d.")
+    p.add_argument("--post_lift_lidar", action="store_true",
+                   help="Enable dense target-grid LiDAR VFE fusion after lifting. "
+                        "This keeps the 2D LiDAR/image fusion path, appends "
+                        "configured LiDAR channels plus mask/count, and fuses "
+                        "back to the original lifted feature width before the adapter.")
+    p.add_argument("--post_lift_lidar_channels", type=int, default=32,
+                   help="Dense post-lift LiDAR feature channels before mask/count channels.")
     # Whether to convert BatchNorm layers to SyncBatchNorm under DDP. "auto"
     # (default) turns it on for the monoscene head (which is BN-heavy and
     # otherwise broken at per-GPU bs=1) and leaves the light head alone (it
@@ -502,6 +509,9 @@ def main():
         model_kwargs["fusion3d_num_heads"] = args.fusion3d_num_heads
         model_kwargs["fusion3d_ffn_ratio"] = args.fusion3d_ffn_ratio
         model_kwargs["fusion3d_alpha_init"] = args.fusion3d_alpha_init
+        model_kwargs["post_lift_lidar_enabled"] = args.post_lift_lidar
+        model_kwargs["post_lift_lidar_channels"] = args.post_lift_lidar_channels
+        model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
     if args.exp == "monoscene_lidar":
@@ -510,13 +520,17 @@ def main():
             f"[fusion3d] enabled={args.fusion3d} "
             f"seq_len={args.fusion3d_seq_len} alpha_init={args.fusion3d_alpha_init}"
         )
+        print(
+            f"[post_lift_lidar] enabled={args.post_lift_lidar} "
+            f"channels={args.post_lift_lidar_channels}"
+        )
 
     # Freeze the OccAny backbone in every variant (light / monoscene /
     # monoscene_lidar). Trainable params:
     #   light:            lifting + occ_head
     #   monoscene:        lifting + occ_head (incl. monoscene adapter)
     #   monoscene_lidar:  lifting + occ_head + fusion
-    #                      (+ optional sorted-3D self-attention)
+    #                      (+ optional sorted-3D self-attention / post-lift VFE)
     for p in model.backbone.parameters():
         p.requires_grad = False
 
@@ -588,6 +602,20 @@ def main():
             model_to_save.occ_head.load_state_dict(ckpt["occ_head"], strict=False)
         if "fusion" in ckpt and hasattr(model_to_save, "fusion"):
             model_to_save.fusion.load_state_dict(ckpt["fusion"], strict=False)
+        if (
+            "post_lift_lidar" in ckpt
+            and getattr(model_to_save, "post_lift_lidar", None) is not None
+        ):
+            model_to_save.post_lift_lidar.load_state_dict(
+                ckpt["post_lift_lidar"], strict=False
+            )
+        if (
+            "post_lift_fuse" in ckpt
+            and getattr(model_to_save, "post_lift_fuse", None) is not None
+        ):
+            model_to_save.post_lift_fuse.load_state_dict(
+                ckpt["post_lift_fuse"], strict=False
+            )
         if "optimizer" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
@@ -631,6 +659,13 @@ def main():
             }
             if args.exp == "monoscene_lidar":
                 ckpt_payload["fusion"] = model_to_save.fusion.state_dict()
+                if model_to_save.post_lift_lidar is not None:
+                    ckpt_payload["post_lift_lidar"] = (
+                        model_to_save.post_lift_lidar.state_dict()
+                    )
+                    ckpt_payload["post_lift_fuse"] = (
+                        model_to_save.post_lift_fuse.state_dict()
+                    )
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
@@ -642,6 +677,10 @@ def main():
                 }
                 if "fusion" in ckpt_payload:
                     keep_payload["fusion"] = ckpt_payload["fusion"]
+                if "post_lift_lidar" in ckpt_payload:
+                    keep_payload["post_lift_lidar"] = ckpt_payload["post_lift_lidar"]
+                if "post_lift_fuse" in ckpt_payload:
+                    keep_payload["post_lift_fuse"] = ckpt_payload["post_lift_fuse"]
                 torch.save(
                     keep_payload,
                     os.path.join(args.output_dir, f"checkpoint-{epoch}.pth"),

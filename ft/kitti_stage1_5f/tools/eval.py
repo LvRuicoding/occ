@@ -66,6 +66,8 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--fusion3d_num_heads", type=int, default=None)
     p.add_argument("--fusion3d_ffn_ratio", type=float, default=None)
     p.add_argument("--fusion3d_alpha_init", type=float, default=None)
+    p.add_argument("--post_lift_lidar", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--post_lift_lidar_channels", type=int, default=None)
     p.add_argument("--max_points_per_sweep", type=int, default=None)
 
     p.add_argument("--width", type=int, default=None)
@@ -140,6 +142,12 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args: Dict) -> Non
     args.fusion3d_alpha_init = float(
         _override_or_ckpt(args, ckpt_args, "fusion3d_alpha_init", 0.0)
     )
+    args.post_lift_lidar = bool(
+        _override_or_ckpt(args, ckpt_args, "post_lift_lidar", False)
+    )
+    args.post_lift_lidar_channels = int(
+        _override_or_ckpt(args, ckpt_args, "post_lift_lidar_channels", 32)
+    )
     args.max_points_per_sweep = int(
         _override_or_ckpt(args, ckpt_args, "max_points_per_sweep", 0)
     )
@@ -192,6 +200,9 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
         model_kwargs["fusion3d_num_heads"] = args.fusion3d_num_heads
         model_kwargs["fusion3d_ffn_ratio"] = args.fusion3d_ffn_ratio
         model_kwargs["fusion3d_alpha_init"] = args.fusion3d_alpha_init
+        model_kwargs["post_lift_lidar_enabled"] = args.post_lift_lidar
+        model_kwargs["post_lift_lidar_channels"] = args.post_lift_lidar_channels
+        model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     for p in model.backbone.parameters():
         p.requires_grad = False
@@ -207,6 +218,17 @@ def _load_stage1_weights(model: nn.Module, ckpt: Dict, args: argparse.Namespace)
         if "fusion" not in ckpt:
             raise KeyError("monoscene_lidar checkpoint must contain a 'fusion' state_dict.")
         model.fusion.load_state_dict(ckpt["fusion"], strict=True)
+        if args.post_lift_lidar:
+            if "post_lift_lidar" not in ckpt:
+                raise KeyError(
+                    "post-lift LiDAR checkpoint must contain a 'post_lift_lidar' state_dict."
+                )
+            model.post_lift_lidar.load_state_dict(ckpt["post_lift_lidar"], strict=True)
+            if "post_lift_fuse" not in ckpt:
+                raise KeyError(
+                    "post-lift LiDAR checkpoint must contain a 'post_lift_fuse' state_dict."
+                )
+            model.post_lift_fuse.load_state_dict(ckpt["post_lift_fuse"], strict=True)
 
 
 def _log_path_for_ckpt(ckpt_path: Path, log_name: str) -> Path:

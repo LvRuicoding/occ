@@ -6,9 +6,12 @@ before being handed to the lifting module. The default fusion interaction is
 windowed image+voxel self-attention; the original cross-attention path remains
 available via ``fusion_attn_type="cross"``. An optional second fusion stage
 (``fusion3d_enabled=True``) applies fixed-length 3D-sorted self-attention over
-image and voxel tokens using local pointmaps. The OccAny encoder and decoder
-stay fully frozen and remain inside ``@torch.no_grad()``; only fusion, lifting,
-and occ_head are trained.
+image and voxel tokens using local pointmaps. A separate optional post-lift
+branch (``post_lift_lidar_enabled=True``) aggregates all LiDAR sweeps into the
+target voxel grid, fuses the dense LiDAR features with lifted reconstruction
+features, and preserves the original adapter input shape. The OccAny encoder
+and decoder stay fully frozen and remain inside ``@torch.no_grad()``; only
+fusion, lifting, optional post-lift VFE, and occ_head are trained.
 
 Forward signature adds the LiDAR/calib inputs produced by
 ``Kitti5FrameStage1MonoLidarDataset`` + ``collate_stage1_mono_lidar``.
@@ -21,8 +24,24 @@ import torch
 import torch.nn as nn
 
 from .lifting import OccAnyRecon5FrameBackbone, Stage1LiftingModule
-from .lidar_fusion import LidarImageFusionModule
+from .lidar_fusion import LidarImageFusionModule, TargetGridLidarFeatureEncoder
 from ..heads import MonoSceneOccHead
+
+
+def _build_shared_point_mlp(hidden: int, d_voxel: int) -> nn.Sequential:
+    """Per-point MLP shared between the cam-frame VFE and the target-grid VFE.
+
+    Both VFEs use the same per-point feature layout (xyz, intensity, cell-offset
+    = 7 dims) and the same d_voxel output width, so they can share the body of
+    the encoder. Frame-specific signal in the target-grid path is injected by a
+    separate ``time_embed`` *after* this MLP, so this module stays time-agnostic.
+    """
+    return nn.Sequential(
+        nn.Linear(7, hidden),
+        nn.LayerNorm(hidden),
+        nn.GELU(),
+        nn.Linear(hidden, d_voxel),
+    )
 
 
 class Stage1SSCMonoLidarModel(nn.Module):
@@ -59,6 +78,12 @@ class Stage1SSCMonoLidarModel(nn.Module):
         fusion3d_num_heads: Optional[int] = None,
         fusion3d_ffn_ratio: float = 2.0,
         fusion3d_alpha_init: float = 0.0,
+        post_lift_lidar_enabled: bool = False,
+        post_lift_lidar_channels: int = 32,
+        post_lift_lidar_d_voxel: int = 128,
+        post_lift_lidar_hidden: int = 64,
+        post_lift_lidar_pe_num_freqs: int = 8,
+        num_frames: int = 5,
     ) -> None:
         super().__init__()
         if c_lift != 64:
@@ -75,6 +100,24 @@ class Stage1SSCMonoLidarModel(nn.Module):
         if occany_ckpt is not None:
             self.backbone.load_checkpoint(occany_ckpt)
 
+        # When the post-lift target-grid VFE is enabled, share the per-point
+        # MLP with the cam-frame VFE so both paths use a consistent
+        # point->feature mapping. This requires matching d_voxel / hidden
+        # between the two; we surface a clear error rather than silently
+        # building two distinct MLPs.
+        shared_point_mlp: Optional[nn.Module] = None
+        if post_lift_lidar_enabled:
+            if int(fusion_d_voxel) != int(post_lift_lidar_d_voxel):
+                raise ValueError(
+                    "post_lift_lidar requires fusion_d_voxel == "
+                    f"post_lift_lidar_d_voxel; got {fusion_d_voxel} vs "
+                    f"{post_lift_lidar_d_voxel}."
+                )
+            shared_point_mlp = _build_shared_point_mlp(
+                hidden=int(post_lift_lidar_hidden),
+                d_voxel=int(post_lift_lidar_d_voxel),
+            )
+
         H_t = backbone_img_size[0] // patch_size
         W_t = backbone_img_size[1] // patch_size
         self.fusion = LidarImageFusionModule(
@@ -88,6 +131,7 @@ class Stage1SSCMonoLidarModel(nn.Module):
             vox_size=fusion_vox_size,
             vox_grid=fusion_vox_grid,
             vfe_d_voxel=fusion_d_voxel,
+            vfe_hidden=int(post_lift_lidar_hidden) if shared_point_mlp is not None else 64,
             pe_num_freqs=fusion_pe_num_freqs,
             attn_type=fusion_attn_type,
             fusion3d_enabled=fusion3d_enabled,
@@ -95,6 +139,7 @@ class Stage1SSCMonoLidarModel(nn.Module):
             fusion3d_num_heads=fusion3d_num_heads,
             fusion3d_ffn_ratio=fusion3d_ffn_ratio,
             fusion3d_alpha_init=fusion3d_alpha_init,
+            vfe_point_mlp=shared_point_mlp,
         )
 
         self.lifting = Stage1LiftingModule(
@@ -104,6 +149,37 @@ class Stage1SSCMonoLidarModel(nn.Module):
             voxel_origin=voxel_origin,
             voxel_size=voxel_size,
             grid_size=grid_size,
+        )
+        self.post_lift_lidar = (
+            TargetGridLidarFeatureEncoder(
+                vox_origin=voxel_origin,
+                base_vox_size=tuple(float(v) * 2.0 for v in voxel_size),
+                base_grid=tuple(max(1, int(v) // 2) for v in grid_size),
+                full_grid=grid_size,
+                d_voxel=post_lift_lidar_d_voxel,
+                d_out=post_lift_lidar_channels,
+                hidden=post_lift_lidar_hidden,
+                pe_num_freqs=post_lift_lidar_pe_num_freqs,
+                num_frames=num_frames,
+                point_mlp=shared_point_mlp,
+            )
+            if post_lift_lidar_enabled
+            else None
+        )
+        # +3 aux channels: occupancy mask, log1p point density, frame diversity.
+        self.post_lift_fuse = (
+            nn.Sequential(
+                nn.Conv3d(
+                    64 + int(post_lift_lidar_channels) + 3,
+                    64,
+                    kernel_size=1,
+                    bias=False,
+                ),
+                nn.GroupNorm(8, 64),
+                nn.GELU(),
+            )
+            if post_lift_lidar_enabled
+            else None
         )
 
         self.occ_head = MonoSceneOccHead(
@@ -147,8 +223,38 @@ class Stage1SSCMonoLidarModel(nn.Module):
             c_rec=backbone_out["c_rec"],
             T_target_from_refcam=T_target_from_refcam,
         )
-        feats = torch.cat([V_rec, W_rec], dim=1)  # (B, 65, 256, 256, 32)
+        feats_to_cat = [V_rec, W_rec]
+        if self.post_lift_lidar is not None:
+            cam2world_per_frame = self._stack_cam2world(views, device=V_rec.device)
+            V_lidar, M_lidar, C_lidar, D_lidar = self.post_lift_lidar(
+                points_per_frame=points_per_frame,
+                T_cam_from_velo=T_cam_from_velo.to(device=V_rec.device),
+                T_target_from_refcam=T_target_from_refcam.to(device=V_rec.device),
+                cam2world_per_frame=cam2world_per_frame,
+                output_dtype=V_rec.dtype,
+            )
+            V_rec = self.post_lift_fuse(
+                torch.cat([V_rec, V_lidar, M_lidar, C_lidar, D_lidar], dim=1)
+            )
+            feats_to_cat = [V_rec, W_rec]
+        feats = torch.cat(feats_to_cat, dim=1)
         return self.occ_head(feats)
+
+    @staticmethod
+    def _stack_cam2world(
+        views: List[Dict[str, torch.Tensor]],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if len(views) == 0:
+            raise RuntimeError("views must contain at least one frame.")
+        if "cam2world" not in views[0]:
+            raise RuntimeError(
+                "post-lift LiDAR fusion requires views[f]['cam2world'] for every frame."
+            )
+        return torch.stack(
+            [v["cam2world"].to(device=device, dtype=torch.float32) for v in views],
+            dim=1,
+        )
 
 
 __all__ = ["Stage1SSCMonoLidarModel"]
