@@ -1345,6 +1345,539 @@ class LidarImageFusionModule(nn.Module):
         return image_feat.view(B, N, self.H_t, self.W_t, D)
 
 
+# ============================================================================
+# Memory voxel fusion (per-frame VFE → warp to target → NA 3D cross-attn)
+# ============================================================================
+
+
+class PerFrameMemoryVoxelEncoder(nn.Module):
+    """Build a dense per-frame voxel volume in *that frame's own velo coords*.
+
+    For each sample, voxelize raw points in frame-velo coords into a fixed
+    ``(Gx, Gy, Gz)`` grid (same physical extent as the target velo grid), run a
+    shared point MLP + per-voxel max-pool, project to ``d_out``, and add a
+    sinusoidal 3D positional encoding on the voxel center.
+
+    Returns:
+      ``M_dense``: ``(B, d_out, Gx, Gy, Gz)`` dense per-frame voxel features.
+      ``occ``:     ``(B, 1, Gx, Gy, Gz)`` 1 where any point landed.
+
+    The point MLP can be shared with the cam-frame VFE / target-grid VFE so all
+    three paths use a consistent point→feature mapping.
+    """
+
+    def __init__(
+        self,
+        vox_origin: Tuple[float, float, float] = (0.0, -25.6, -2.0),
+        vox_size: Tuple[float, float, float] = (0.4, 0.4, 0.4),
+        vox_grid: Tuple[int, int, int] = (128, 128, 16),
+        d_voxel: int = 128,
+        d_out: int = 64,
+        hidden: int = 64,
+        pe_num_freqs: int = 8,
+        point_mlp: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "vox_origin", torch.tensor(vox_origin, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "vox_size", torch.tensor(vox_size, dtype=torch.float32), persistent=False
+        )
+        self.vox_grid: Tuple[int, int, int] = tuple(int(v) for v in vox_grid)
+        self.d_out = int(d_out)
+        self.d_voxel = int(d_voxel)
+
+        if point_mlp is not None:
+            self.point_mlp = point_mlp
+        else:
+            self.point_mlp = nn.Sequential(
+                nn.Linear(7, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Linear(hidden, d_voxel),
+            )
+        self.voxel_norm = nn.LayerNorm(d_voxel)
+        self.voxel_proj = nn.Linear(d_voxel, d_out)
+
+        self.pe_num_freqs = int(pe_num_freqs)
+        pe_dim = 3 * 2 * self.pe_num_freqs
+        self.pe_proj = nn.Linear(pe_dim, d_out)
+
+    def forward(
+        self,
+        points_velo_list: List[torch.Tensor],  # list length B of (P_b, 4) in frame-velo
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = len(points_velo_list)
+        Gx, Gy, Gz = self.vox_grid
+        device = self.vox_origin.device
+        # Dtype follows point MLP's parameter dtype (matches autocast / module dtype).
+        param_dtype = next(self.voxel_proj.parameters()).dtype
+
+        non_empty_points: List[torch.Tensor] = []
+        non_empty_batch: List[torch.Tensor] = []
+        for b, pts in enumerate(points_velo_list):
+            if pts.shape[0] == 0:
+                continue
+            pts = pts.to(device=device, non_blocking=True)
+            non_empty_points.append(pts)
+            non_empty_batch.append(
+                torch.full((pts.shape[0],), b, dtype=torch.long, device=device)
+            )
+
+        if len(non_empty_points) == 0:
+            M_dense = torch.zeros(
+                (B, self.d_out, Gx, Gy, Gz), device=device, dtype=param_dtype
+            )
+            occ = torch.zeros((B, 1, Gx, Gy, Gz), device=device, dtype=param_dtype)
+            return M_dense, occ
+
+        pts_cat = torch.cat(non_empty_points, dim=0)
+        batch_cat = torch.cat(non_empty_batch, dim=0)
+
+        vox_origin = self.vox_origin
+        vox_size = self.vox_size
+
+        p_velo = pts_cat[:, :3].to(dtype=torch.float32)
+        intensity = pts_cat[:, 3:4].to(dtype=torch.float32)
+
+        idx_f = (p_velo - vox_origin) / vox_size
+        idx = idx_f.floor().long()
+        valid = (
+            torch.isfinite(p_velo).all(dim=-1)
+            & torch.isfinite(intensity).flatten()
+            & (idx[:, 0] >= 0) & (idx[:, 0] < Gx)
+            & (idx[:, 1] >= 0) & (idx[:, 1] < Gy)
+            & (idx[:, 2] >= 0) & (idx[:, 2] < Gz)
+        )
+        if not bool(valid.any().item()):
+            M_dense = torch.zeros(
+                (B, self.d_out, Gx, Gy, Gz), device=device, dtype=param_dtype
+            )
+            occ = torch.zeros((B, 1, Gx, Gy, Gz), device=device, dtype=param_dtype)
+            return M_dense, occ
+
+        idx = idx[valid]
+        p_valid = p_velo[valid]
+        i_valid = intensity[valid]
+        batch_valid = batch_cat[valid]
+        voxel_center = (idx.to(p_valid.dtype) + 0.5) * vox_size + vox_origin
+        rel = p_valid - voxel_center
+        point_feat = torch.cat([p_valid, i_valid, rel], dim=-1)  # (P_valid, 7)
+
+        h = self.point_mlp(point_feat)  # (P_valid, d_voxel)
+        d_voxel = h.shape[-1]
+
+        # Linear index combining batch + voxel for unified scatter.
+        lin = (((batch_valid * Gx + idx[:, 0]) * Gy + idx[:, 1]) * Gz + idx[:, 2])
+        uniq_lin, inverse = torch.unique(lin, return_inverse=True)
+        U = int(uniq_lin.shape[0])
+
+        neg_inf = torch.finfo(h.dtype).min
+        voxel_feat = torch.full((U, d_voxel), neg_inf, dtype=h.dtype, device=device)
+        voxel_feat.scatter_reduce_(
+            0,
+            inverse.unsqueeze(-1).expand(-1, d_voxel),
+            h,
+            reduce="amax",
+            include_self=False,
+        )
+        voxel_feat = voxel_feat.masked_fill(voxel_feat == neg_inf, 0.0)
+
+        voxel_feat = self.voxel_norm(voxel_feat)
+        voxel_proj = self.voxel_proj(voxel_feat)
+
+        # Decompose uniq_lin → (b, ix, iy, iz) for per-voxel positional encoding.
+        local = uniq_lin % (Gx * Gy * Gz)
+        u_x = local // (Gy * Gz)
+        u_y = (local // Gz) % Gy
+        u_z = local % Gz
+        uniq_idx = torch.stack([u_x, u_y, u_z], dim=-1).to(dtype=torch.float32)
+        vc_world = (uniq_idx + 0.5) * vox_size + vox_origin
+        pe = VoxelFeatureEncoder._sinusoidal_pe_3d(vc_world, self.pe_num_freqs).to(
+            voxel_proj.dtype
+        )
+        voxel_proj = voxel_proj + self.pe_proj(pe)
+
+        n_voxels = B * Gx * Gy * Gz
+        dense_flat = torch.zeros(
+            (n_voxels, self.d_out), dtype=voxel_proj.dtype, device=device
+        )
+        dense_flat[uniq_lin] = voxel_proj
+        occ_flat = torch.zeros((n_voxels, 1), dtype=voxel_proj.dtype, device=device)
+        occ_flat[uniq_lin] = 1.0
+
+        M_dense = (
+            dense_flat.view(B, Gx, Gy, Gz, self.d_out).permute(0, 4, 1, 2, 3).contiguous()
+        )
+        occ = occ_flat.view(B, Gx, Gy, Gz, 1).permute(0, 4, 1, 2, 3).contiguous()
+        return M_dense, occ
+
+
+class NA3DCrossAttn(nn.Module):
+    """3D neighborhood cross-attention: Q from one volume, KV from another.
+
+    Built on natten's fused ``na3d`` op (natten >= 0.20). For each query
+    position ``(x, y, z)``, the output attends over a ``K × K × K``
+    neighborhood of the KV volume around ``(x, y, z)``. Both volumes must
+    share the same spatial dims ``(B, X, Y, Z, D)``.
+
+    natten is imported lazily so that this module file stays importable when
+    natten isn't installed; instantiating ``NA3DCrossAttn`` is the point where
+    the missing dependency is reported.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        kernel_size: int,
+    ) -> None:
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model {d_model} not divisible by num_heads {num_heads}"
+            )
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.d_model // self.num_heads
+        self.kernel_size = int(kernel_size)
+
+        try:
+            from natten import na3d  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - exercised at runtime
+            raise ImportError(
+                "MemoryVoxel3DFusion requires the natten library "
+                "(https://github.com/SHI-Labs/NATTEN). "
+                "Install a 3D-NA-capable build, e.g. `pip install natten`."
+            ) from exc
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(
+        self,
+        q_feat: torch.Tensor,   # (B, X, Y, Z, D)
+        kv_feat: torch.Tensor,  # (B, X, Y, Z, D)
+    ) -> torch.Tensor:
+        from natten import na3d
+
+        B, X, Y, Z, D = q_feat.shape
+        if D != self.d_model:
+            raise RuntimeError(f"q_feat dim {D} != d_model {self.d_model}")
+        if kv_feat.shape != q_feat.shape:
+            raise RuntimeError(
+                f"kv_feat shape {tuple(kv_feat.shape)} != q_feat shape "
+                f"{tuple(q_feat.shape)}; NA cross-attention requires matching grids."
+            )
+        H = self.num_heads
+        Dh = self.head_dim
+        K = self.kernel_size
+
+        # natten.na3d expects heads-last layout: (B, X, Y, Z, H, Dh).
+        q = self.q_proj(q_feat).view(B, X, Y, Z, H, Dh)
+        k = self.k_proj(kv_feat).view(B, X, Y, Z, H, Dh)
+        v = self.v_proj(kv_feat).view(B, X, Y, Z, H, Dh)
+
+        out = na3d(q, k, v, kernel_size=K)  # (B, X, Y, Z, H, Dh)
+        out = out.reshape(B, X, Y, Z, D)
+        return self.out_proj(out)
+
+
+class NA3DCrossAttnBlock(nn.Module):
+    """LN(Q) + LN(KV) → NA cross-attn → residual → LN → FFN → residual."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        kernel_size: int,
+        ffn_ratio: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.cross_attn = NA3DCrossAttn(d_model, num_heads, kernel_size)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        hidden = int(d_model * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(
+        self,
+        q_feat: torch.Tensor,   # (B, X, Y, Z, D)
+        kv_feat: torch.Tensor,  # (B, X, Y, Z, D)
+    ) -> torch.Tensor:
+        q_norm = self.norm_q(q_feat)
+        kv_norm = self.norm_kv(kv_feat)
+        q_feat = q_feat + self.cross_attn(q_norm, kv_norm)
+        q_feat = q_feat + self.ffn(self.norm_ffn(q_feat))
+        return q_feat
+
+
+class MemoryVoxel3DFusion(nn.Module):
+    """Per-frame voxel memory + warp + max-pool + NA 3D cross-attn into V_post_fuse.
+
+    Pipeline:
+      1) Per-frame VFE → dense voxel volume in each frame's own velo coords.
+      2) Backward-warp each per-frame volume to target velo at ``base_grid``
+         (trilinear ``grid_sample``) and incrementally max-pool across frames.
+      3) Empty voxels (no frame contributed) are filled with a learnable
+         "no-feature" embedding so the network can distinguish them from
+         genuine zero features.
+      4) ``V_post_fuse`` is downsampled to ``base_grid``; ``num_layers`` 3D NA
+         cross-attention blocks attend its tokens (Q) to the memory volume
+         (KV) over a ``K^3`` neighborhood.
+      5) The attention-induced delta (post-attn minus pre-attn) is upsampled
+         to ``full_grid`` and applied as an alpha-gated residual to
+         ``V_post_fuse``. With ``alpha = 0`` at init the branch is identity.
+
+    Coordinates: "target velo" is the same frame the upstream lifting and
+    ``TargetGridLidarFeatureEncoder`` target — i.e. the reference camera's
+    velodyne frame, given via ``T_target_from_refcam``. Each frame's per-frame
+    VFE works in *that frame's* velo coords (no cam-frame transform) and is
+    warped using:
+
+        T_target_velo_from_frame_velo = T_tr @ inv(c2w[ref]) @ c2w[f] @ T_cv
+
+    which matches the chain used by ``TargetGridLidarFeatureEncoder``.
+    """
+
+    def __init__(
+        self,
+        c_in: int = 64,
+        c_mem: int = 64,
+        num_heads: int = 4,
+        kernel: int = 7,
+        num_layers: int = 2,
+        ffn_ratio: float = 2.0,
+        full_grid: Tuple[int, int, int] = (256, 256, 32),
+        base_grid: Tuple[int, int, int] = (128, 128, 16),
+        vox_origin: Tuple[float, float, float] = (0.0, -25.6, -2.0),
+        vox_size: Tuple[float, float, float] = (0.4, 0.4, 0.4),
+        d_voxel: int = 128,
+        hidden: int = 64,
+        pe_num_freqs: int = 8,
+        alpha_init: float = 0.0,
+        occ_eps: float = 1e-4,
+        point_mlp: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__()
+        if c_in != c_mem:
+            raise ValueError(
+                "MemoryVoxel3DFusion requires c_in == c_mem; "
+                f"got c_in={c_in}, c_mem={c_mem}."
+            )
+        full_grid = tuple(int(v) for v in full_grid)
+        base_grid = tuple(int(v) for v in base_grid)
+        for f_, b_ in zip(full_grid, base_grid):
+            if f_ % b_ != 0:
+                raise ValueError(
+                    f"full_grid {full_grid} must be a multiple of base_grid {base_grid}"
+                )
+        if any(b_ < int(kernel) for b_ in base_grid):
+            raise ValueError(
+                f"NA kernel {kernel} too large for base_grid {base_grid}"
+            )
+
+        self.c_in = int(c_in)
+        self.c_mem = int(c_mem)
+        self.full_grid = full_grid
+        self.base_grid = base_grid
+        self.occ_eps = float(occ_eps)
+
+        self.per_frame_vfe = PerFrameMemoryVoxelEncoder(
+            vox_origin=vox_origin,
+            vox_size=vox_size,
+            vox_grid=base_grid,
+            d_voxel=d_voxel,
+            d_out=c_mem,
+            hidden=hidden,
+            pe_num_freqs=pe_num_freqs,
+            point_mlp=point_mlp,
+        )
+        self.no_feat_embed = nn.Parameter(torch.zeros(c_mem))
+
+        self.na_blocks = nn.ModuleList(
+            [
+                NA3DCrossAttnBlock(
+                    d_model=c_in,
+                    num_heads=num_heads,
+                    kernel_size=kernel,
+                    ffn_ratio=ffn_ratio,
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+        self.pool_stride = tuple(f_ // b_ for f_, b_ in zip(full_grid, base_grid))
+
+        Gx, Gy, Gz = base_grid
+        ix = torch.arange(Gx, dtype=torch.float32)
+        iy = torch.arange(Gy, dtype=torch.float32)
+        iz = torch.arange(Gz, dtype=torch.float32)
+        grid_ix, grid_iy, grid_iz = torch.meshgrid(ix, iy, iz, indexing="ij")
+        idx = torch.stack([grid_ix, grid_iy, grid_iz], dim=-1)  # (Gx, Gy, Gz, 3)
+        origin_t = torch.tensor(vox_origin, dtype=torch.float32)
+        size_t = torch.tensor(vox_size, dtype=torch.float32)
+        target_centers = (idx + 0.5) * size_t + origin_t
+        self.register_buffer("target_centers", target_centers, persistent=False)
+        self.register_buffer("vox_origin", origin_t, persistent=False)
+        self.register_buffer("vox_size", size_t, persistent=False)
+
+    def _warp_to_target(
+        self,
+        M_f: torch.Tensor,           # (B, C, Gx, Gy, Gz) in frame-f velo
+        occ_f: torch.Tensor,         # (B, 1, Gx, Gy, Gz)
+        T_target_from_frame_velo: torch.Tensor,  # (B, 4, 4)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Backward-warp a frame-velo volume to target velo at ``base_grid``.
+
+        grid_sample 5D conventions: input ``(B, C, D_in, H_in, W_in)`` with our
+        axis mapping ``D_in=Gx, H_in=Gy, W_in=Gz``. grid last-dim ordering is
+        ``(norm_in_W, norm_in_H, norm_in_D)`` = ``(norm_z, norm_y, norm_x)`` in
+        our axis layout.
+        """
+        B, C, Gx, Gy, Gz = M_f.shape
+        device = M_f.device
+
+        T_inv = torch.linalg.inv(T_target_from_frame_velo.to(dtype=torch.float32))
+        R_inv = T_inv[:, :3, :3]  # (B, 3, 3)
+        t_inv = T_inv[:, :3, 3]   # (B, 3)
+
+        centers = self.target_centers.to(device=device)  # (Gx, Gy, Gz, 3)
+        flat_centers = centers.reshape(-1, 3).unsqueeze(0).expand(B, -1, 3)  # (B, V, 3)
+        p_frame = (
+            torch.einsum("bij,bvj->bvi", R_inv, flat_centers) + t_inv.unsqueeze(1)
+        )
+        p_frame = p_frame.reshape(B, Gx, Gy, Gz, 3)
+
+        origin = self.vox_origin.to(device=device)
+        size = self.vox_size.to(device=device)
+        frac = (p_frame - origin) / size  # (B, Gx, Gy, Gz, 3) -> (fx, fy, fz)
+        norm_x = (frac[..., 0] / float(Gx)) * 2.0 - 1.0
+        norm_y = (frac[..., 1] / float(Gy)) * 2.0 - 1.0
+        norm_z = (frac[..., 2] / float(Gz)) * 2.0 - 1.0
+        grid = torch.stack([norm_z, norm_y, norm_x], dim=-1)  # (B, Gx, Gy, Gz, 3)
+
+        M_warp = F.grid_sample(
+            M_f.to(dtype=torch.float32),
+            grid,
+            mode="bilinear",  # trilinear for 5D
+            padding_mode="zeros",
+            align_corners=False,
+        ).to(dtype=M_f.dtype)
+        occ_warp = F.grid_sample(
+            occ_f.to(dtype=torch.float32),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).to(dtype=occ_f.dtype)
+        return M_warp, occ_warp
+
+    def forward(
+        self,
+        V_post_fuse: torch.Tensor,                     # (B, c_in, Fx, Fy, Fz)
+        points_per_frame: List[List[torch.Tensor]],
+        T_cam_from_velo: torch.Tensor,                 # (B, 4, 4)
+        T_target_from_refcam: torch.Tensor,            # (B, 4, 4)
+        cam2world_per_frame: torch.Tensor,             # (B, N, 4, 4)
+    ) -> torch.Tensor:
+        B = len(points_per_frame)
+        if B == 0:
+            raise RuntimeError("points_per_frame must contain at least one sample.")
+        N = len(points_per_frame[0])
+        if cam2world_per_frame.shape[:2] != (B, N):
+            raise RuntimeError(
+                f"cam2world shape {tuple(cam2world_per_frame.shape[:2])} "
+                f"does not match points_per_frame ({B}, {N})."
+            )
+
+        device = V_post_fuse.device
+        dtype = V_post_fuse.dtype
+        T_cv = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        T_tr = T_target_from_refcam.to(device=device, dtype=torch.float32)
+        c2w = cam2world_per_frame.to(device=device, dtype=torch.float32)
+        c2w_ref_inv = torch.linalg.inv(c2w[:, 0])  # (B, 4, 4)
+
+        Gx, Gy, Gz = self.base_grid
+        c_mem = self.c_mem
+        M_acc = torch.full(
+            (B, c_mem, Gx, Gy, Gz),
+            float("-inf"),
+            device=device,
+            dtype=dtype,
+        )
+        occ_acc = torch.zeros((B, 1, Gx, Gy, Gz), device=device, dtype=dtype)
+        any_contribution = False
+
+        for f in range(N):
+            points_list = [points_per_frame[b][f] for b in range(B)]
+            M_f, occ_f = self.per_frame_vfe(points_list)
+            M_f = M_f.to(dtype=dtype)
+            occ_f = occ_f.to(dtype=dtype)
+            if float(occ_f.abs().sum().item()) == 0.0:
+                continue
+            T_target_velo_from_frame_velo = (
+                T_tr @ c2w_ref_inv @ c2w[:, f] @ T_cv
+            )  # (B, 4, 4)
+            M_f_w, occ_f_w = self._warp_to_target(
+                M_f, occ_f, T_target_velo_from_frame_velo
+            )
+            M_acc = torch.maximum(M_acc, M_f_w)
+            occ_acc = torch.maximum(occ_acc, occ_f_w)
+            any_contribution = True
+
+        if not any_contribution:
+            return V_post_fuse
+
+        # Voxels that never received any contribution still carry -inf from the
+        # max-pool init; replace with 0 before the no-feature substitution.
+        M_acc = torch.where(
+            torch.isfinite(M_acc), M_acc, torch.zeros_like(M_acc)
+        )
+        occ_mask = (occ_acc > self.occ_eps).to(dtype=dtype)
+        no_feat = self.no_feat_embed.view(1, -1, 1, 1, 1).to(dtype=dtype)
+        M_final = M_acc * occ_mask + no_feat * (1.0 - occ_mask)
+
+        if self.pool_stride != (1, 1, 1):
+            V_down = F.avg_pool3d(
+                V_post_fuse, kernel_size=self.pool_stride, stride=self.pool_stride
+            )
+        else:
+            V_down = V_post_fuse
+
+        V_attn = V_down.permute(0, 2, 3, 4, 1).contiguous()
+        M_attn = M_final.permute(0, 2, 3, 4, 1).contiguous()
+
+        T = V_attn
+        for blk in self.na_blocks:
+            T = blk(T, M_attn)
+
+        delta_attn = T - V_attn  # cross-attn + FFN residual contribution only
+        delta_base = delta_attn.permute(0, 4, 1, 2, 3).contiguous()
+
+        if self.pool_stride != (1, 1, 1):
+            delta_up = F.interpolate(
+                delta_base.to(dtype=torch.float32),
+                size=self.full_grid,
+                mode="trilinear",
+                align_corners=False,
+            ).to(dtype=dtype)
+        else:
+            delta_up = delta_base
+
+        alpha = self.alpha.to(dtype=dtype)
+        return V_post_fuse + alpha * delta_up
+
+
 __all__ = [
     "VoxelFeatureEncoder",
     "TargetGridLidarFeatureEncoder",
@@ -1352,4 +1885,8 @@ __all__ = [
     "WindowedSelfAttnLayer",
     "Sorted3DTokenFusionLayer",
     "LidarImageFusionModule",
+    "PerFrameMemoryVoxelEncoder",
+    "NA3DCrossAttn",
+    "NA3DCrossAttnBlock",
+    "MemoryVoxel3DFusion",
 ]

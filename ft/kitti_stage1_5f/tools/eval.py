@@ -68,6 +68,13 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--fusion3d_alpha_init", type=float, default=None)
     p.add_argument("--post_lift_lidar", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--post_lift_lidar_channels", type=int, default=None)
+    p.add_argument("--memory_voxel", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--memory_voxel_kernel", type=int, default=None)
+    p.add_argument("--memory_voxel_num_heads", type=int, default=None)
+    p.add_argument("--memory_voxel_num_layers", type=int, default=None)
+    p.add_argument("--memory_voxel_ffn_ratio", type=float, default=None)
+    p.add_argument("--memory_voxel_alpha_init", type=float, default=None)
+    p.add_argument("--memory_voxel_d_voxel", type=int, default=None)
     p.add_argument("--max_points_per_sweep", type=int, default=None)
 
     p.add_argument("--width", type=int, default=None)
@@ -148,6 +155,27 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args: Dict) -> Non
     args.post_lift_lidar_channels = int(
         _override_or_ckpt(args, ckpt_args, "post_lift_lidar_channels", 32)
     )
+    args.memory_voxel = bool(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel", False)
+    )
+    args.memory_voxel_kernel = int(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel_kernel", 7)
+    )
+    args.memory_voxel_num_heads = int(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel_num_heads", 4)
+    )
+    args.memory_voxel_num_layers = int(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel_num_layers", 2)
+    )
+    args.memory_voxel_ffn_ratio = float(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel_ffn_ratio", 2.0)
+    )
+    args.memory_voxel_alpha_init = float(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel_alpha_init", 0.0)
+    )
+    args.memory_voxel_d_voxel = int(
+        _override_or_ckpt(args, ckpt_args, "memory_voxel_d_voxel", 128)
+    )
     args.max_points_per_sweep = int(
         _override_or_ckpt(args, ckpt_args, "max_points_per_sweep", 0)
     )
@@ -202,6 +230,13 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
         model_kwargs["fusion3d_alpha_init"] = args.fusion3d_alpha_init
         model_kwargs["post_lift_lidar_enabled"] = args.post_lift_lidar
         model_kwargs["post_lift_lidar_channels"] = args.post_lift_lidar_channels
+        model_kwargs["memory_voxel_enabled"] = args.memory_voxel
+        model_kwargs["memory_voxel_kernel"] = args.memory_voxel_kernel
+        model_kwargs["memory_voxel_num_heads"] = args.memory_voxel_num_heads
+        model_kwargs["memory_voxel_num_layers"] = args.memory_voxel_num_layers
+        model_kwargs["memory_voxel_ffn_ratio"] = args.memory_voxel_ffn_ratio
+        model_kwargs["memory_voxel_alpha_init"] = args.memory_voxel_alpha_init
+        model_kwargs["memory_voxel_d_voxel"] = args.memory_voxel_d_voxel
         model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     for p in model.backbone.parameters():
@@ -229,6 +264,12 @@ def _load_stage1_weights(model: nn.Module, ckpt: Dict, args: argparse.Namespace)
                     "post-lift LiDAR checkpoint must contain a 'post_lift_fuse' state_dict."
                 )
             model.post_lift_fuse.load_state_dict(ckpt["post_lift_fuse"], strict=True)
+        if args.memory_voxel:
+            if "memory_fusion" not in ckpt:
+                raise KeyError(
+                    "memory-voxel checkpoint must contain a 'memory_fusion' state_dict."
+                )
+            model.memory_fusion.load_state_dict(ckpt["memory_fusion"], strict=True)
 
 
 def _log_path_for_ckpt(ckpt_path: Path, log_name: str) -> Path:

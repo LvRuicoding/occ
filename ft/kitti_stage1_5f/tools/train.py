@@ -139,6 +139,25 @@ def get_args_parser() -> argparse.ArgumentParser:
                         "back to the original lifted feature width before the adapter.")
     p.add_argument("--post_lift_lidar_channels", type=int, default=32,
                    help="Dense post-lift LiDAR feature channels before mask/count channels.")
+    p.add_argument("--memory_voxel", action="store_true",
+                   help="Enable 3D memory voxel fusion: per-frame VFE produces a "
+                        "dense voxel volume per frame, historical frames are "
+                        "warped to the reference frame and max-pooled, then "
+                        "natten 3D cross-attention attends V_post_fuse (Q) to "
+                        "the memory volume (KV). Identity at init (alpha=0).")
+    p.add_argument("--memory_voxel_kernel", type=int, default=7,
+                   help="3D neighborhood kernel size for --memory_voxel NA cross-attn.")
+    p.add_argument("--memory_voxel_num_heads", type=int, default=4,
+                   help="Attention heads for --memory_voxel NA cross-attn.")
+    p.add_argument("--memory_voxel_num_layers", type=int, default=2,
+                   help="Number of stacked NA cross-attn blocks in --memory_voxel.")
+    p.add_argument("--memory_voxel_ffn_ratio", type=float, default=2.0,
+                   help="FFN hidden ratio inside each --memory_voxel NA block.")
+    p.add_argument("--memory_voxel_alpha_init", type=float, default=0.0,
+                   help="Initial residual gate value for --memory_voxel.")
+    p.add_argument("--memory_voxel_d_voxel", type=int, default=128,
+                   help="Per-frame VFE point-MLP output dim for --memory_voxel. "
+                        "Must equal post_lift_lidar_d_voxel when both are enabled.")
     # Whether to convert BatchNorm layers to SyncBatchNorm under DDP. "auto"
     # (default) turns it on for the monoscene head (which is BN-heavy and
     # otherwise broken at per-GPU bs=1) and leaves the light head alone (it
@@ -511,6 +530,13 @@ def main():
         model_kwargs["fusion3d_alpha_init"] = args.fusion3d_alpha_init
         model_kwargs["post_lift_lidar_enabled"] = args.post_lift_lidar
         model_kwargs["post_lift_lidar_channels"] = args.post_lift_lidar_channels
+        model_kwargs["memory_voxel_enabled"] = args.memory_voxel
+        model_kwargs["memory_voxel_kernel"] = args.memory_voxel_kernel
+        model_kwargs["memory_voxel_num_heads"] = args.memory_voxel_num_heads
+        model_kwargs["memory_voxel_num_layers"] = args.memory_voxel_num_layers
+        model_kwargs["memory_voxel_ffn_ratio"] = args.memory_voxel_ffn_ratio
+        model_kwargs["memory_voxel_alpha_init"] = args.memory_voxel_alpha_init
+        model_kwargs["memory_voxel_d_voxel"] = args.memory_voxel_d_voxel
         model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
@@ -523,6 +549,13 @@ def main():
         print(
             f"[post_lift_lidar] enabled={args.post_lift_lidar} "
             f"channels={args.post_lift_lidar_channels}"
+        )
+        print(
+            f"[memory_voxel] enabled={args.memory_voxel} "
+            f"kernel={args.memory_voxel_kernel} "
+            f"heads={args.memory_voxel_num_heads} "
+            f"layers={args.memory_voxel_num_layers} "
+            f"alpha_init={args.memory_voxel_alpha_init}"
         )
 
     # Freeze the OccAny backbone in every variant (light / monoscene /
@@ -616,6 +649,13 @@ def main():
             model_to_save.post_lift_fuse.load_state_dict(
                 ckpt["post_lift_fuse"], strict=False
             )
+        if (
+            "memory_fusion" in ckpt
+            and getattr(model_to_save, "memory_fusion", None) is not None
+        ):
+            model_to_save.memory_fusion.load_state_dict(
+                ckpt["memory_fusion"], strict=False
+            )
         if "optimizer" in ckpt:
             try:
                 optimizer.load_state_dict(ckpt["optimizer"])
@@ -666,6 +706,10 @@ def main():
                     ckpt_payload["post_lift_fuse"] = (
                         model_to_save.post_lift_fuse.state_dict()
                     )
+                if model_to_save.memory_fusion is not None:
+                    ckpt_payload["memory_fusion"] = (
+                        model_to_save.memory_fusion.state_dict()
+                    )
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
@@ -681,6 +725,8 @@ def main():
                     keep_payload["post_lift_lidar"] = ckpt_payload["post_lift_lidar"]
                 if "post_lift_fuse" in ckpt_payload:
                     keep_payload["post_lift_fuse"] = ckpt_payload["post_lift_fuse"]
+                if "memory_fusion" in ckpt_payload:
+                    keep_payload["memory_fusion"] = ckpt_payload["memory_fusion"]
                 torch.save(
                     keep_payload,
                     os.path.join(args.output_dir, f"checkpoint-{epoch}.pth"),

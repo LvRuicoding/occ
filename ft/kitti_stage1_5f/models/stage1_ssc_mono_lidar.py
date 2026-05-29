@@ -9,9 +9,14 @@ available via ``fusion_attn_type="cross"``. An optional second fusion stage
 image and voxel tokens using local pointmaps. A separate optional post-lift
 branch (``post_lift_lidar_enabled=True``) aggregates all LiDAR sweeps into the
 target voxel grid, fuses the dense LiDAR features with lifted reconstruction
-features, and preserves the original adapter input shape. The OccAny encoder
+features, and preserves the original adapter input shape. A separate optional
+memory voxel branch (``memory_voxel_enabled=True``) builds a dense per-frame
+voxel volume in each frame's velo coords, warps the historical frames to the
+reference frame, max-pools them, and applies 3D NA cross-attention (natten) to
+refine the post-lift output with this multi-frame memory. The OccAny encoder
 and decoder stay fully frozen and remain inside ``@torch.no_grad()``; only
-fusion, lifting, optional post-lift VFE, and occ_head are trained.
+fusion, lifting, optional post-lift VFE, optional memory voxel fusion, and
+occ_head are trained.
 
 Forward signature adds the LiDAR/calib inputs produced by
 ``Kitti5FrameStage1MonoLidarDataset`` + ``collate_stage1_mono_lidar``.
@@ -24,7 +29,11 @@ import torch
 import torch.nn as nn
 
 from .lifting import OccAnyRecon5FrameBackbone, Stage1LiftingModule
-from .lidar_fusion import LidarImageFusionModule, TargetGridLidarFeatureEncoder
+from .lidar_fusion import (
+    LidarImageFusionModule,
+    MemoryVoxel3DFusion,
+    TargetGridLidarFeatureEncoder,
+)
 from ..heads import MonoSceneOccHead
 
 
@@ -83,6 +92,16 @@ class Stage1SSCMonoLidarModel(nn.Module):
         post_lift_lidar_d_voxel: int = 128,
         post_lift_lidar_hidden: int = 64,
         post_lift_lidar_pe_num_freqs: int = 8,
+        # Memory voxel fusion (NA 3D cross-attn over warped per-frame voxel memory)
+        memory_voxel_enabled: bool = False,
+        memory_voxel_kernel: int = 7,
+        memory_voxel_num_heads: int = 4,
+        memory_voxel_num_layers: int = 2,
+        memory_voxel_ffn_ratio: float = 2.0,
+        memory_voxel_alpha_init: float = 0.0,
+        memory_voxel_d_voxel: int = 128,
+        memory_voxel_hidden: int = 64,
+        memory_voxel_pe_num_freqs: int = 8,
         num_frames: int = 5,
     ) -> None:
         super().__init__()
@@ -104,7 +123,9 @@ class Stage1SSCMonoLidarModel(nn.Module):
         # MLP with the cam-frame VFE so both paths use a consistent
         # point->feature mapping. This requires matching d_voxel / hidden
         # between the two; we surface a clear error rather than silently
-        # building two distinct MLPs.
+        # building two distinct MLPs. When memory voxel fusion is also enabled,
+        # the same shared MLP is reused for its per-frame VFE, with an extra
+        # constraint on memory_voxel_d_voxel.
         shared_point_mlp: Optional[nn.Module] = None
         if post_lift_lidar_enabled:
             if int(fusion_d_voxel) != int(post_lift_lidar_d_voxel):
@@ -112,6 +133,14 @@ class Stage1SSCMonoLidarModel(nn.Module):
                     "post_lift_lidar requires fusion_d_voxel == "
                     f"post_lift_lidar_d_voxel; got {fusion_d_voxel} vs "
                     f"{post_lift_lidar_d_voxel}."
+                )
+            if memory_voxel_enabled and int(memory_voxel_d_voxel) != int(
+                post_lift_lidar_d_voxel
+            ):
+                raise ValueError(
+                    "When both post_lift_lidar and memory_voxel are enabled, "
+                    "memory_voxel_d_voxel must equal post_lift_lidar_d_voxel; "
+                    f"got {memory_voxel_d_voxel} vs {post_lift_lidar_d_voxel}."
                 )
             shared_point_mlp = _build_shared_point_mlp(
                 hidden=int(post_lift_lidar_hidden),
@@ -182,6 +211,31 @@ class Stage1SSCMonoLidarModel(nn.Module):
             else None
         )
 
+        # Memory voxel fusion: NA 3D cross-attn between warped per-frame voxel
+        # memory and the post_lift_fuse output (or, when post_lift_lidar is
+        # disabled, the raw lifted V_rec). Identity at init via alpha=0.
+        self.memory_fusion = (
+            MemoryVoxel3DFusion(
+                c_in=c_lift,
+                c_mem=c_lift,
+                num_heads=int(memory_voxel_num_heads),
+                kernel=int(memory_voxel_kernel),
+                num_layers=int(memory_voxel_num_layers),
+                ffn_ratio=float(memory_voxel_ffn_ratio),
+                full_grid=tuple(int(s) for s in grid_size),
+                base_grid=tuple(max(1, int(s) // 2) for s in grid_size),
+                vox_origin=voxel_origin,
+                vox_size=tuple(float(v) * 2.0 for v in voxel_size),
+                d_voxel=int(memory_voxel_d_voxel),
+                hidden=int(memory_voxel_hidden),
+                pe_num_freqs=int(memory_voxel_pe_num_freqs),
+                alpha_init=float(memory_voxel_alpha_init),
+                point_mlp=shared_point_mlp if memory_voxel_enabled else None,
+            )
+            if memory_voxel_enabled
+            else None
+        )
+
         self.occ_head = MonoSceneOccHead(
             num_classes=num_classes,
             feature=head_feature,
@@ -223,9 +277,10 @@ class Stage1SSCMonoLidarModel(nn.Module):
             c_rec=backbone_out["c_rec"],
             T_target_from_refcam=T_target_from_refcam,
         )
-        feats_to_cat = [V_rec, W_rec]
-        if self.post_lift_lidar is not None:
+        cam2world_per_frame: Optional[torch.Tensor] = None
+        if self.post_lift_lidar is not None or self.memory_fusion is not None:
             cam2world_per_frame = self._stack_cam2world(views, device=V_rec.device)
+        if self.post_lift_lidar is not None:
             V_lidar, M_lidar, C_lidar, D_lidar = self.post_lift_lidar(
                 points_per_frame=points_per_frame,
                 T_cam_from_velo=T_cam_from_velo.to(device=V_rec.device),
@@ -236,8 +291,15 @@ class Stage1SSCMonoLidarModel(nn.Module):
             V_rec = self.post_lift_fuse(
                 torch.cat([V_rec, V_lidar, M_lidar, C_lidar, D_lidar], dim=1)
             )
-            feats_to_cat = [V_rec, W_rec]
-        feats = torch.cat(feats_to_cat, dim=1)
+        if self.memory_fusion is not None:
+            V_rec = self.memory_fusion(
+                V_post_fuse=V_rec,
+                points_per_frame=points_per_frame,
+                T_cam_from_velo=T_cam_from_velo.to(device=V_rec.device),
+                T_target_from_refcam=T_target_from_refcam.to(device=V_rec.device),
+                cam2world_per_frame=cam2world_per_frame,
+            )
+        feats = torch.cat([V_rec, W_rec], dim=1)
         return self.occ_head(feats)
 
     @staticmethod

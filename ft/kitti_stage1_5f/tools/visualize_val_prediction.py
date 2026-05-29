@@ -106,6 +106,13 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--fusion3d_alpha_init", type=float, default=None)
     p.add_argument("--post_lift_lidar", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--post_lift_lidar_channels", type=int, default=None)
+    p.add_argument("--memory_voxel", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--memory_voxel_kernel", type=int, default=None)
+    p.add_argument("--memory_voxel_num_heads", type=int, default=None)
+    p.add_argument("--memory_voxel_num_layers", type=int, default=None)
+    p.add_argument("--memory_voxel_ffn_ratio", type=float, default=None)
+    p.add_argument("--memory_voxel_alpha_init", type=float, default=None)
+    p.add_argument("--memory_voxel_d_voxel", type=int, default=None)
     p.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
     p.add_argument("--max_voxels_plot", default=60000, type=int)
     p.add_argument("--elev", default=22.0, type=float)
@@ -517,6 +524,27 @@ def build_model(
         model_kwargs["post_lift_lidar_channels"] = int(
             ckpt_arg(ckpt_args, "post_lift_lidar_channels", 32)
         )
+        model_kwargs["memory_voxel_enabled"] = bool(
+            ckpt_arg(ckpt_args, "memory_voxel", False)
+        )
+        model_kwargs["memory_voxel_kernel"] = int(
+            ckpt_arg(ckpt_args, "memory_voxel_kernel", 7)
+        )
+        model_kwargs["memory_voxel_num_heads"] = int(
+            ckpt_arg(ckpt_args, "memory_voxel_num_heads", 4)
+        )
+        model_kwargs["memory_voxel_num_layers"] = int(
+            ckpt_arg(ckpt_args, "memory_voxel_num_layers", 2)
+        )
+        model_kwargs["memory_voxel_ffn_ratio"] = float(
+            ckpt_arg(ckpt_args, "memory_voxel_ffn_ratio", 2.0)
+        )
+        model_kwargs["memory_voxel_alpha_init"] = float(
+            ckpt_arg(ckpt_args, "memory_voxel_alpha_init", 0.0)
+        )
+        model_kwargs["memory_voxel_d_voxel"] = int(
+            ckpt_arg(ckpt_args, "memory_voxel_d_voxel", 128)
+        )
         model_kwargs["num_frames"] = int(ckpt_arg(ckpt_args, "num_frames", 5))
 
     model = model_cls(**model_kwargs).to(device)
@@ -529,6 +557,12 @@ def build_model(
         if model.post_lift_lidar is not None:
             model.post_lift_lidar.load_state_dict(ckpt["post_lift_lidar"], strict=True)
             model.post_lift_fuse.load_state_dict(ckpt["post_lift_fuse"], strict=True)
+        if model.memory_fusion is not None:
+            if "memory_fusion" not in ckpt:
+                raise KeyError(
+                    "memory-voxel checkpoint must contain a 'memory_fusion' state_dict."
+                )
+            model.memory_fusion.load_state_dict(ckpt["memory_fusion"], strict=True)
     model.eval()
     return model
 
@@ -612,6 +646,13 @@ def main() -> None:
         "fusion3d_alpha_init",
         "post_lift_lidar",
         "post_lift_lidar_channels",
+        "memory_voxel",
+        "memory_voxel_kernel",
+        "memory_voxel_num_heads",
+        "memory_voxel_num_layers",
+        "memory_voxel_ffn_ratio",
+        "memory_voxel_alpha_init",
+        "memory_voxel_d_voxel",
     ):
         value = getattr(args, name)
         if value is not None:

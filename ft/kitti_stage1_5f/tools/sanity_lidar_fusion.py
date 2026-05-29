@@ -9,11 +9,13 @@ Verifies (on a toy synthetic batch, CPU or single GPU):
 
 Run:
     python -m ft.kitti_stage1_5f.tools.sanity_lidar_fusion
+    python -m ft.kitti_stage1_5f.tools.sanity_lidar_fusion --memory_voxel
 """
 from __future__ import annotations
 
 from .. import _paths  # noqa: F401
 
+import argparse
 import sys
 
 import numpy as np
@@ -73,17 +75,52 @@ def _toy_lidar(B: int, N: int, device: torch.device):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--memory_voxel",
+        action="store_true",
+        help="Also exercise the memory voxel branch (requires natten installed).",
+    )
+    parser.add_argument(
+        "--post_lift_lidar",
+        action="store_true",
+        help="Enable post-lift LiDAR VFE alongside the rest of the stack.",
+    )
+    parser.add_argument(
+        "--memory_voxel_kernel",
+        type=int,
+        default=7,
+    )
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(0)
     np.random.seed(0)
 
     B, N = 1, 5
     print("[1] Building Stage1SSCMonoLidarModel (no ckpt, random init)...")
-    model = Stage1SSCMonoLidarModel(
+    build_kwargs = dict(
         occany_ckpt=None,
         backbone_img_size=(160, 512),
         backbone_dtype=torch.float32,
-    ).to(device)
+        post_lift_lidar_enabled=bool(args.post_lift_lidar or args.memory_voxel),
+        memory_voxel_enabled=bool(args.memory_voxel),
+        memory_voxel_kernel=int(args.memory_voxel_kernel),
+        # natten 3D kernels are happiest with head_dim>=16; with c_lift=64 that
+        # means at most 4 heads. Keep the default small for the sanity check.
+        memory_voxel_num_heads=4,
+        memory_voxel_num_layers=2,
+        # Set alpha != 0 so the memory branch actually contributes a gradient
+        # to its own params during the sanity backward pass.
+        memory_voxel_alpha_init=0.1,
+    )
+    try:
+        model = Stage1SSCMonoLidarModel(**build_kwargs).to(device)
+    except ImportError as exc:
+        if args.memory_voxel:
+            print(f"[skip] memory_voxel sanity skipped: {exc}")
+            sys.exit(0)
+        raise
     # Freeze the OccAny backbone exactly as train.py does.
     for p in model.backbone.parameters():
         p.requires_grad = False
@@ -116,6 +153,22 @@ def main():
         "lifting": list(model.lifting.parameters()),
         "occ_head.first": list(model.occ_head.parameters())[:1],
     }
+    if model.memory_fusion is not None:
+        mf = model.memory_fusion
+        expected_grad.update(
+            {
+                "memory.per_frame_vfe.voxel_proj": list(
+                    mf.per_frame_vfe.voxel_proj.parameters()
+                ),
+                "memory.na_blocks.0.cross_attn.q_proj": list(
+                    mf.na_blocks[0].cross_attn.q_proj.parameters()
+                ),
+                "memory.na_blocks.0.cross_attn.out_proj": list(
+                    mf.na_blocks[0].cross_attn.out_proj.parameters()
+                ),
+                "memory.alpha": [mf.alpha],
+            }
+        )
     expected_no_grad = {
         "encoder.first": list(model.backbone.encoder.parameters())[:1],
         "decoder.first": list(model.backbone.decoder.parameters())[:1],
