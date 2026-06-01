@@ -98,6 +98,10 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--velodyne_root", default=None, type=str,
                    help="Raw KITTI Odometry root for monoscene_lidar checkpoints.")
     p.add_argument("--max_points_per_sweep", default=None, type=int)
+    p.add_argument("--width", default=None, type=int)
+    p.add_argument("--height", default=None, type=int)
+    p.add_argument("--num_frames", default=None, type=int)
+    p.add_argument("--frame_stride", default=None, type=int)
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default=None)
     p.add_argument("--fusion3d", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--fusion3d_seq_len", type=int, default=None)
@@ -659,10 +663,10 @@ def main() -> None:
             ckpt_args[name] = value
     processed_root, kittiodo_root, occany_ckpt = resolve_paths(args, ckpt_args)
 
-    width = int(ckpt_arg(ckpt_args, "width", 512))
-    height = int(ckpt_arg(ckpt_args, "height", 160))
-    num_frames = int(ckpt_arg(ckpt_args, "num_frames", 5))
-    frame_stride = int(ckpt_arg(ckpt_args, "frame_stride", 1))
+    width = int(override_or_ckpt(args, ckpt_args, "width", 512))
+    height = int(override_or_ckpt(args, ckpt_args, "height", 160))
+    num_frames = int(override_or_ckpt(args, ckpt_args, "num_frames", 5))
+    frame_stride = int(override_or_ckpt(args, ckpt_args, "frame_stride", 1))
     velodyne_root = args.velodyne_root or ckpt_arg(
         ckpt_args, "velodyne_root", str(DEFAULT_VELODYNE_ROOT)
     )
