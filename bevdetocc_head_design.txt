@@ -1,0 +1,17 @@
+1. 冻结 OccAny，只加载 occany_recon.pth，不再加载 checkpoint-19。
+2. 输入保持当前 OccAny 配置：图像 160×512，patch=16，token grid=10×32。
+3. OccAny 输出每帧 768-dim 2D token 后，先用 1×1 Conv2d 将 768 通道压到 256，再送入 LSS。
+4. LSS 使用 KITTI 当前 occupancy grid，而不是 BEVDet nuScenes grid。最终 grid 为 256×256×32，坐标系为 target frame KITTI velo。
+5. 禁用 BEVStereo stereo cost volume，只保留 depth distribution + LSS lifting。
+6. 每帧 LSS 输出 32ch 3D feature。
+7. 每帧 LiDAR 点云用新的轻量 VFE 生成 32ch voxel memory feature，建立在该帧 velo 坐标系下。
+8. 对每一帧做 NATTEN 融合：Q=LSS 3D feature，KV=同帧 voxel memory feature。输出仍为 32ch enhanced LSS feature。
+9. 将 enhanced LSS feature 与 memory feature concat，得到每帧 64ch volume。
+10. 将 5 帧 64ch volume 全部 warp 到 target frame。
+11. temporal aggregation 使用 concat 5 帧通道后 Conv3d 压回 64ch，即 320→64。
+12. 将聚合后的 target-frame 64ch 3D feature 送入 BEVDet 的 LSSFPN3D + final_conv + predicter。
+13. BEVDet head 输出类别改为 KITTI 20 类。
+14. 封装输出 layout，保证最终返回 {"ssc_logit": logits}，其中 logits shape 为 (B, 20, 256, 256, 32)。
+15. 不使用 MonoScene context-prior / relation loss，不输出 P_logits。
+16. gt_depth 暂时预留接口，之后会用 KITTI LiDAR 投影生成 sparse gt_depth 再加入 depth loss。
+17. 除 OccAny 外，其余所有新增模块全部随机初始化并参与训练。
