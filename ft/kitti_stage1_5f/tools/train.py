@@ -49,14 +49,25 @@ from ft.semantickitti_ft.losses import SSCLoss
 from ..datasets import (
     KITTI_SSC_CLASS_NAMES,
     Kitti5FrameStage1Dataset,
+    Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoDataset,
     Kitti5FrameStage1MonoLidarDataset,
     collate_stage1,
+    collate_stage1_lidar,
     collate_stage1_mono,
     collate_stage1_mono_lidar,
 )
 from ..losses_monoscene import MonoSceneSSCLoss
-from ..models import Stage1SSCModel, Stage1SSCMonoModel, Stage1SSCMonoLidarModel
+from ..models import (
+    Stage1SSCBEVDetOccLidarModel,
+    Stage1SSCModel,
+    Stage1SSCMonoModel,
+    Stage1SSCMonoLidarModel,
+)
+
+
+LIDAR_EXPS = ("monoscene_lidar", "bevdetocc_lidar")
+MONOSCENE_LOSS_EXPS = ("monoscene", "monoscene_lidar")
 
 
 def get_args_parser() -> argparse.ArgumentParser:
@@ -111,11 +122,18 @@ def get_args_parser() -> argparse.ArgumentParser:
     #                         (post-decoder, pre-lifting). The OccAny backbone
     #                         stays fully frozen; only fusion/lifting/head train.
     #                         Requires --velodyne_root.
-    p.add_argument("--exp", choices=["light", "monoscene", "monoscene_lidar"], default="light")
+    #   - "bevdetocc_lidar": keep the first 2D LiDAR/image cross-attention,
+    #                         then use LSS + LiDAR memory + NATTEN + BEVDet-OCC
+    #                         3D encoder/head. Requires --velodyne_root.
+    p.add_argument(
+        "--exp",
+        choices=["light", "monoscene", "monoscene_lidar", "bevdetocc_lidar"],
+        default="light",
+    )
     # LiDAR-fusion-only options.
     p.add_argument("--velodyne_root", default=None, type=str,
                    help="Raw KITTI Odometry root: <velodyne_root>/sequences/<seq>/velodyne/*.bin. "
-                        "Required when --exp=monoscene_lidar.")
+                        "Required for LiDAR experiments.")
     p.add_argument("--max_points_per_sweep", type=int, default=0,
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default="self",
@@ -175,6 +193,14 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
         output_resolution=(args.width, args.height),
         cam_idx=0,
     )
+    if args.exp == "bevdetocc_lidar":
+        if not args.velodyne_root:
+            raise ValueError("--velodyne_root is required when --exp=bevdetocc_lidar")
+        return Kitti5FrameStage1LidarDataset(
+            velodyne_root=args.velodyne_root,
+            max_points_per_sweep=args.max_points_per_sweep,
+            **common,
+        )
     if args.exp == "monoscene_lidar":
         if not args.velodyne_root:
             raise ValueError("--velodyne_root is required when --exp=monoscene_lidar")
@@ -189,6 +215,8 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
 
 
 def _collate_fn(args):
+    if args.exp == "bevdetocc_lidar":
+        return collate_stage1_lidar
     if args.exp == "monoscene_lidar":
         return collate_stage1_mono_lidar
     if args.exp == "monoscene":
@@ -233,6 +261,15 @@ def _state_dict_hash(state_dict: Dict[str, torch.Tensor]) -> str:
     return h.hexdigest()[:16]
 
 
+def _state_dict_without_backbone(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Checkpoint only trainable/non-frozen modules for the BEVDet-OCC branch."""
+    return {
+        k: v
+        for k, v in model.state_dict().items()
+        if not k.startswith("backbone.")
+    }
+
+
 def _move_views_to_device(views: List[Dict[str, torch.Tensor]], device: torch.device):
     moved: List[Dict[str, torch.Tensor]] = []
     for v in views:
@@ -260,7 +297,7 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     """Dispatch the model forward to match each experiment's signature."""
     views = _move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
-    if args.exp == "monoscene_lidar":
+    if args.exp in LIDAR_EXPS:
         return model(
             views,
             T_target_from_refcam,
@@ -356,9 +393,11 @@ def train_one_epoch(
 
         with ctx:
             out = _model_forward(model, batch, device, args)
-            if args.exp in ("monoscene", "monoscene_lidar"):
+            if args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, details = criterion(out, target, cp)
+            elif args.exp == "bevdetocc_lidar":
+                loss, details = criterion(out["ssc_logit"], target)
             else:
                 loss, details = criterion(out, target)
         loss_value = float(loss.detach())
@@ -423,9 +462,12 @@ def eval_one_epoch(
         )
         with ctx:
             out = _model_forward(model, batch, device, args)
-            if args.exp in ("monoscene", "monoscene_lidar"):
+            if args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, _details = criterion(out, target, cp)
+                logits = out["ssc_logit"]
+            elif args.exp == "bevdetocc_lidar":
+                loss, _details = criterion(out["ssc_logit"], target)
                 logits = out["ssc_logit"]
             else:
                 loss, _details = criterion(out, target)
@@ -506,7 +548,9 @@ def main():
     else:
         backbone_dtype = torch.float32
 
-    if args.exp == "monoscene_lidar":
+    if args.exp == "bevdetocc_lidar":
+        model_cls = Stage1SSCBEVDetOccLidarModel
+    elif args.exp == "monoscene_lidar":
         model_cls = Stage1SSCMonoLidarModel
     elif args.exp == "monoscene":
         model_cls = Stage1SSCMonoModel
@@ -521,6 +565,9 @@ def main():
         backbone_img_size=(args.height, args.width),
         backbone_dtype=backbone_dtype,
     )
+    if args.exp == "bevdetocc_lidar":
+        model_kwargs["fusion_attn_type"] = "cross"
+        model_kwargs["num_frames"] = args.num_frames
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
         model_kwargs["fusion3d_enabled"] = args.fusion3d
@@ -540,6 +587,9 @@ def main():
         model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
+    if args.exp == "bevdetocc_lidar":
+        print("[fusion] attn_type=cross (forced for BEVDet-OCC LiDAR branch)")
+        print("[backend] LSS half-grid -> LiDAR memory -> NATTEN -> BEVDet CustomResNet3D/LSSFPN3D")
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")
         print(
@@ -577,7 +627,7 @@ def main():
     # without this step. Light head uses GroupNorm so it's unaffected.
     syncbn_on = args.distributed and (
         args.syncbn == "on"
-        or (args.syncbn == "auto" and args.exp in ("monoscene", "monoscene_lidar"))
+        or (args.syncbn == "auto" and args.exp in ("monoscene", "monoscene_lidar", "bevdetocc_lidar"))
     )
     if syncbn_on:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -590,7 +640,7 @@ def main():
         # valid voxel projections, and the per-sample point cloud changes which
         # windows are active — both incompatible with static_graph=True.
         ddp_kwargs = dict(device_ids=[args.gpu])
-        if args.exp == "monoscene_lidar":
+        if args.exp in LIDAR_EXPS:
             ddp_kwargs.update(find_unused_parameters=True, static_graph=False)
         else:
             ddp_kwargs.update(find_unused_parameters=False, static_graph=True)
@@ -608,7 +658,7 @@ def main():
         trainable_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
     )
     loss_scaler = NativeScaler(enabled=(args.amp == "fp16"))
-    if args.exp in ("monoscene", "monoscene_lidar"):
+    if args.exp in MONOSCENE_LOSS_EXPS:
         criterion = MonoSceneSSCLoss().to(device)
     else:
         criterion = SSCLoss().to(device)
@@ -629,11 +679,17 @@ def main():
                 f"checkpoint expected {prev_hash}, current --occany_ckpt gives {backbone_hash}. "
                 "Refusing to resume — the frozen backbone has changed."
             )
-        if "lifting" in ckpt:
+        if args.exp == "bevdetocc_lidar" and "model" in ckpt:
+            status = model_to_save.load_state_dict(ckpt["model"], strict=False)
+            print(
+                "[resume:bevdetocc_lidar] loaded non-backbone model state: "
+                f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
+            )
+        elif args.exp != "bevdetocc_lidar" and "lifting" in ckpt:
             model_to_save.lifting.load_state_dict(ckpt["lifting"], strict=False)
-        if "occ_head" in ckpt:
+        if args.exp != "bevdetocc_lidar" and "occ_head" in ckpt:
             model_to_save.occ_head.load_state_dict(ckpt["occ_head"], strict=False)
-        if "fusion" in ckpt and hasattr(model_to_save, "fusion"):
+        if args.exp != "bevdetocc_lidar" and "fusion" in ckpt and hasattr(model_to_save, "fusion"):
             model_to_save.fusion.load_state_dict(ckpt["fusion"], strict=False)
         if (
             "post_lift_lidar" in ckpt
@@ -688,45 +744,62 @@ def main():
             )
 
         if misc.is_main_process():
-            ckpt_payload = {
-                "lifting": model_to_save.lifting.state_dict(),
-                "occ_head": model_to_save.occ_head.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scaler": loss_scaler.state_dict(),
-                "epoch": epoch,
-                "args": vars(args),
-                "backbone_hash": backbone_hash,
-            }
-            if args.exp == "monoscene_lidar":
-                ckpt_payload["fusion"] = model_to_save.fusion.state_dict()
-                if model_to_save.post_lift_lidar is not None:
-                    ckpt_payload["post_lift_lidar"] = (
-                        model_to_save.post_lift_lidar.state_dict()
-                    )
-                    ckpt_payload["post_lift_fuse"] = (
-                        model_to_save.post_lift_fuse.state_dict()
-                    )
-                if model_to_save.memory_fusion is not None:
-                    ckpt_payload["memory_fusion"] = (
-                        model_to_save.memory_fusion.state_dict()
-                    )
+            if args.exp == "bevdetocc_lidar":
+                ckpt_payload = {
+                    "model": _state_dict_without_backbone(model_to_save),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": loss_scaler.state_dict(),
+                    "epoch": epoch,
+                    "args": vars(args),
+                    "backbone_hash": backbone_hash,
+                }
+            else:
+                ckpt_payload = {
+                    "lifting": model_to_save.lifting.state_dict(),
+                    "occ_head": model_to_save.occ_head.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": loss_scaler.state_dict(),
+                    "epoch": epoch,
+                    "args": vars(args),
+                    "backbone_hash": backbone_hash,
+                }
+                if args.exp == "monoscene_lidar":
+                    ckpt_payload["fusion"] = model_to_save.fusion.state_dict()
+                    if model_to_save.post_lift_lidar is not None:
+                        ckpt_payload["post_lift_lidar"] = (
+                            model_to_save.post_lift_lidar.state_dict()
+                        )
+                        ckpt_payload["post_lift_fuse"] = (
+                            model_to_save.post_lift_fuse.state_dict()
+                        )
+                    if model_to_save.memory_fusion is not None:
+                        ckpt_payload["memory_fusion"] = (
+                            model_to_save.memory_fusion.state_dict()
+                        )
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
-                keep_payload = {
-                    "lifting": ckpt_payload["lifting"],
-                    "occ_head": ckpt_payload["occ_head"],
-                    "epoch": epoch,
-                    "backbone_hash": backbone_hash,
-                }
-                if "fusion" in ckpt_payload:
-                    keep_payload["fusion"] = ckpt_payload["fusion"]
-                if "post_lift_lidar" in ckpt_payload:
-                    keep_payload["post_lift_lidar"] = ckpt_payload["post_lift_lidar"]
-                if "post_lift_fuse" in ckpt_payload:
-                    keep_payload["post_lift_fuse"] = ckpt_payload["post_lift_fuse"]
-                if "memory_fusion" in ckpt_payload:
-                    keep_payload["memory_fusion"] = ckpt_payload["memory_fusion"]
+                if args.exp == "bevdetocc_lidar":
+                    keep_payload = {
+                        "model": ckpt_payload["model"],
+                        "epoch": epoch,
+                        "backbone_hash": backbone_hash,
+                    }
+                else:
+                    keep_payload = {
+                        "lifting": ckpt_payload["lifting"],
+                        "occ_head": ckpt_payload["occ_head"],
+                        "epoch": epoch,
+                        "backbone_hash": backbone_hash,
+                    }
+                    if "fusion" in ckpt_payload:
+                        keep_payload["fusion"] = ckpt_payload["fusion"]
+                    if "post_lift_lidar" in ckpt_payload:
+                        keep_payload["post_lift_lidar"] = ckpt_payload["post_lift_lidar"]
+                    if "post_lift_fuse" in ckpt_payload:
+                        keep_payload["post_lift_fuse"] = ckpt_payload["post_lift_fuse"]
+                    if "memory_fusion" in ckpt_payload:
+                        keep_payload["memory_fusion"] = ckpt_payload["memory_fusion"]
                 torch.save(
                     keep_payload,
                     os.path.join(args.output_dir, f"checkpoint-{epoch}.pth"),

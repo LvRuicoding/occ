@@ -32,13 +32,23 @@ from occany.utils.image_util import convert_images_to_uint8_hwc
 from ..datasets import (
     KITTI_SSC_CLASS_NAMES,
     Kitti5FrameStage1Dataset,
+    Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoDataset,
     Kitti5FrameStage1MonoLidarDataset,
     collate_stage1,
+    collate_stage1_lidar,
     collate_stage1_mono,
     collate_stage1_mono_lidar,
 )
-from ..models import Stage1SSCModel, Stage1SSCMonoLidarModel, Stage1SSCMonoModel
+from ..models import (
+    Stage1SSCBEVDetOccLidarModel,
+    Stage1SSCModel,
+    Stage1SSCMonoLidarModel,
+    Stage1SSCMonoModel,
+)
+
+
+LIDAR_EXPS = ("monoscene_lidar", "bevdetocc_lidar")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -93,10 +103,10 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--occany_ckpt", default=None, type=str,
                    help="Original OccAny reconstruction checkpoint. Defaults to checkpoint args.")
     p.add_argument("--model_type", "--exp", dest="exp",
-                   choices=["light", "monoscene", "monoscene_lidar"], default=None,
+                   choices=["light", "monoscene", "monoscene_lidar", "bevdetocc_lidar"], default=None,
                    help="Model variant. If omitted, read from checkpoint args.")
     p.add_argument("--velodyne_root", default=None, type=str,
-                   help="Raw KITTI Odometry root for monoscene_lidar checkpoints.")
+                   help="Raw KITTI Odometry root for LiDAR checkpoints.")
     p.add_argument("--max_points_per_sweep", default=None, type=int)
     p.add_argument("--width", default=None, type=int)
     p.add_argument("--height", default=None, type=int)
@@ -145,8 +155,10 @@ def infer_exp(args: argparse.Namespace, ckpt: Dict, ckpt_args: Dict) -> str:
     if args.exp is not None:
         return args.exp
     exp = ckpt_arg(ckpt_args, "exp", None)
-    if exp in {"light", "monoscene", "monoscene_lidar"}:
+    if exp in {"light", "monoscene", "monoscene_lidar", "bevdetocc_lidar"}:
         return str(exp)
+    if "model" in ckpt:
+        return "bevdetocc_lidar"
     if "fusion" in ckpt:
         return "monoscene_lidar"
     occ_keys = ckpt.get("occ_head", {}).keys()
@@ -489,7 +501,9 @@ def build_model(
     else:
         backbone_dtype = torch.bfloat16
 
-    if exp == "monoscene_lidar":
+    if exp == "bevdetocc_lidar":
+        model_cls = Stage1SSCBEVDetOccLidarModel
+    elif exp == "monoscene_lidar":
         model_cls = Stage1SSCMonoLidarModel
     elif exp == "monoscene":
         model_cls = Stage1SSCMonoModel
@@ -508,6 +522,9 @@ def build_model(
         ),
         backbone_dtype=backbone_dtype,
     )
+    if exp == "bevdetocc_lidar":
+        model_kwargs["fusion_attn_type"] = "cross"
+        model_kwargs["num_frames"] = int(ckpt_arg(ckpt_args, "num_frames", 5))
     if exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = ckpt_arg(ckpt_args, "fusion_attn_type", "self")
         model_kwargs["fusion3d_enabled"] = bool(ckpt_arg(ckpt_args, "fusion3d", False))
@@ -552,6 +569,17 @@ def build_model(
         model_kwargs["num_frames"] = int(ckpt_arg(ckpt_args, "num_frames", 5))
 
     model = model_cls(**model_kwargs).to(device)
+    if exp == "bevdetocc_lidar":
+        if "model" not in ckpt:
+            raise KeyError("bevdetocc_lidar checkpoint must contain a 'model' state_dict.")
+        status = model.load_state_dict(ckpt["model"], strict=False)
+        print(
+            "[visualize:bevdetocc_lidar] loaded non-backbone model state: "
+            f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
+        )
+        model.eval()
+        return model
+
     model.lifting.load_state_dict(ckpt["lifting"], strict=True)
     model.occ_head.load_state_dict(ckpt["occ_head"], strict=True)
     if exp == "monoscene_lidar":
@@ -591,6 +619,12 @@ def build_dataset(
         output_resolution=(width, height),
         cam_idx=0,
     )
+    if exp == "bevdetocc_lidar":
+        return Kitti5FrameStage1LidarDataset(
+            velodyne_root=velodyne_root,
+            max_points_per_sweep=max_points_per_sweep,
+            **common,
+        )
     if exp == "monoscene_lidar":
         return Kitti5FrameStage1MonoLidarDataset(
             velodyne_root=velodyne_root,
@@ -603,6 +637,8 @@ def build_dataset(
 
 
 def collate_for_exp(exp: str, samples):
+    if exp == "bevdetocc_lidar":
+        return collate_stage1_lidar(samples)
     if exp == "monoscene_lidar":
         return collate_stage1_mono_lidar(samples)
     if exp == "monoscene":
@@ -613,7 +649,7 @@ def collate_for_exp(exp: str, samples):
 def run_model(model: torch.nn.Module, batch: Dict, exp: str, device: torch.device) -> torch.Tensor:
     views = move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
-    if exp == "monoscene_lidar":
+    if exp in LIDAR_EXPS:
         out = model(
             views,
             T_target_from_refcam,
@@ -673,7 +709,7 @@ def main() -> None:
     max_points_per_sweep = int(
         override_or_ckpt(args, ckpt_args, "max_points_per_sweep", 0)
     )
-    if exp == "monoscene_lidar" and not Path(velodyne_root).exists():
+    if exp in LIDAR_EXPS and not Path(velodyne_root).exists():
         raise FileNotFoundError(f"velodyne_root does not exist: {velodyne_root}")
 
     dataset = build_dataset(
@@ -778,8 +814,8 @@ def main() -> None:
         "model_type": exp,
         "processed_root": processed_root,
         "kittiodo_root": kittiodo_root,
-        "velodyne_root": velodyne_root if exp == "monoscene_lidar" else None,
-        "max_points_per_sweep": max_points_per_sweep if exp == "monoscene_lidar" else None,
+        "velodyne_root": velodyne_root if exp in LIDAR_EXPS else None,
+        "max_points_per_sweep": max_points_per_sweep if exp in LIDAR_EXPS else None,
         "sample_idx": sample_idx,
         "sequence": seq,
         "target_frame_id": target_frame,

@@ -12,7 +12,9 @@ from .kitti_stage1_mono import (
     compute_CP_mega_matrix,
 )
 from .kitti_stage1_mono_lidar import (
+    Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoLidarDataset,
+    collate_stage1_lidar,
     collate_stage1_mono_lidar,
 )
 
@@ -24,6 +26,8 @@ __all__ = [
     "Kitti5FrameStage1MonoDataset",
     "collate_stage1_mono",
     "compute_CP_mega_matrix",
+    "Kitti5FrameStage1LidarDataset",
     "Kitti5FrameStage1MonoLidarDataset",
+    "collate_stage1_lidar",
     "collate_stage1_mono_lidar",
 ]
