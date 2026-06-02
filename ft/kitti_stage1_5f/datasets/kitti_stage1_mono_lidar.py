@@ -27,7 +27,11 @@ from .kitti_stage1_mono import Kitti5FrameStage1MonoDataset
 
 
 def _T_cami_from_velo(calib: Dict[str, np.ndarray], cam_idx: int) -> np.ndarray:
-    """Return T_cam_i_from_velo for cam_idx in {0, 1, 2, 3}.
+    """Return T_cam_i_from_velo for the processed SemanticKITTI camera index.
+
+    The processed Stage-1 files use ``*_0.npz`` for KITTI ``image_2``/``P2``
+    and ``*_1.npz`` for KITTI ``image_3``/``P3``. Do not interpret this
+    ``cam_idx`` as KITTI's physical cam0/cam1/cam2/cam3 id.
 
     Convention:
         T_cami_from_velo = T_cami_from_cam0 @ T_cam0_from_velo
@@ -35,15 +39,13 @@ def _T_cami_from_velo(calib: Dict[str, np.ndarray], cam_idx: int) -> np.ndarray:
     """
     Tr = calib["Tr"]  # (4, 4) T_cam0_from_velo
     if cam_idx == 0:
-        T_cami_from_cam0 = np.eye(4, dtype=np.float64)
-    elif cam_idx == 1:
-        T_cami_from_cam0 = _T_cami_from_cam0(calib["P1"]) if "P1" in calib else np.eye(4)
-    elif cam_idx == 2:
         T_cami_from_cam0 = _T_cami_from_cam0(calib["P2"])
-    elif cam_idx == 3:
+    elif cam_idx == 1:
         T_cami_from_cam0 = _T_cami_from_cam0(calib["P3"])
     else:
-        raise ValueError(f"cam_idx must be in 0..3, got {cam_idx}")
+        raise ValueError(
+            f"processed cam_idx must be 0 (image_2/P2) or 1 (image_3/P3), got {cam_idx}"
+        )
     return (T_cami_from_cam0 @ Tr).astype(np.float64)
 
 
