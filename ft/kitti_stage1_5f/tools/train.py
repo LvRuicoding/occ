@@ -64,7 +64,7 @@ from ..models import (
     Stage1SSCMonoModel,
     Stage1SSCMonoLidarModel,
 )
-from ..models.stage1_ssc_bevdetocc_lidar import bevdet_depth_loss
+from ..models.stage1_ssc_bevdetocc_lidar import bevdet_depth_loss, dense_depth_loss
 
 
 LIDAR_EXPS = ("monoscene_lidar", "bevdetocc_lidar")
@@ -141,6 +141,20 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="Enable BEVDet-style sparse LiDAR depth supervision for --exp=bevdetocc_lidar.")
     p.add_argument("--depth_loss_weight", type=float, default=0.05,
                    help="Weight for BEVDet-style LSS depth loss when --depth_supervision is enabled.")
+    p.add_argument("--dense_depth_supervision", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable target-frame dense depth supervision for --exp=bevdetocc_lidar.")
+    p.add_argument("--dense_depth_loss_weight", type=float, default=0.3,
+                   help="Weight for target-frame continuous dense depth loss.")
+    p.add_argument("--dense_depth_si_weight", type=float, default=0.05,
+                   help="Scale-invariant log-depth term weight inside dense depth loss.")
+    p.add_argument("--dense_depth_min", type=float, default=1.0,
+                   help="Minimum valid dense depth in meters.")
+    p.add_argument("--dense_depth_max", type=float, default=80.0,
+                   help="Maximum valid dense depth in meters.")
+    p.add_argument("--shared_geometry_adapter", action=argparse.BooleanOptionalAction, default=None,
+                   help="Enable the shared geometry adapter. Defaults to --dense_depth_supervision.")
+    p.add_argument("--geometry_channels", type=int, default=256,
+                   help="Shared geometry adapter channel width.")
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default="self",
                    help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
                         "'self' uses image+voxel window self-attention; 'cross' "
@@ -197,6 +211,10 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
         frame_stride=args.frame_stride,
         output_resolution=(args.width, args.height),
         cam_idx=0,
+        load_dense_depth=(
+            args.exp == "bevdetocc_lidar"
+            and bool(getattr(args, "dense_depth_supervision", False))
+        ),
     )
     if args.exp == "bevdetocc_lidar":
         if not args.velodyne_root:
@@ -303,6 +321,7 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     views = _move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
     if args.exp == "bevdetocc_lidar":
+        return_dense_depth = bool(getattr(args, "dense_depth_supervision", False))
         return model(
             views,
             T_target_from_refcam,
@@ -311,6 +330,9 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             batch["K_per_frame"].to(device, non_blocking=True),
             batch["image_hw"].to(device, non_blocking=True),
             return_depth=bool(getattr(args, "depth_supervision", False)),
+            dense_depth_gt=views[0].get("dense_depth") if return_dense_depth else None,
+            has_dense_depth=views[0].get("has_dense_depth") if return_dense_depth else None,
+            return_dense_depth=return_dense_depth,
         )
     if args.exp == "monoscene_lidar":
         return model(
@@ -349,6 +371,39 @@ def _maybe_add_bevdet_depth_loss(
     details["depth_weighted"] = float(depth_weighted.detach())
     details["depth_valid"] = float(depth_valid.detach())
     return loss + depth_weighted, details
+
+
+def _maybe_add_dense_depth_loss(
+    loss: torch.Tensor,
+    details: Dict[str, float],
+    out: Dict,
+    args,
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    if args.exp != "bevdetocc_lidar" or not bool(getattr(args, "dense_depth_supervision", False)):
+        return loss, details
+    required = ("pred_dense_depth", "dense_depth_gt", "has_dense_depth")
+    missing = [k for k in required if k not in out]
+    if missing:
+        raise RuntimeError(
+            "Dense depth supervision expected model output keys "
+            f"{required}, missing={missing}."
+        )
+    dense_weighted, dense_log, dense_si, dense_valid = dense_depth_loss(
+        out["pred_dense_depth"],
+        out["dense_depth_gt"],
+        has_dense_depth=out["has_dense_depth"],
+        min_depth=float(args.dense_depth_min),
+        max_depth=float(args.dense_depth_max),
+        loss_weight=float(args.dense_depth_loss_weight),
+        si_weight=float(args.dense_depth_si_weight),
+        target_index=0,
+    )
+    details = dict(details)
+    details["dense_depth_log"] = float(dense_log.detach())
+    details["dense_depth_si"] = float(dense_si.detach())
+    details["dense_depth_weighted"] = float(dense_weighted.detach())
+    details["dense_depth_valid"] = float(dense_valid.detach())
+    return loss + dense_weighted, details
 
 
 def _sanitize_metric_key(name: str) -> str:
@@ -441,6 +496,7 @@ def train_one_epoch(
             elif args.exp == "bevdetocc_lidar":
                 loss, details = criterion(out["ssc_logit"], target)
                 loss, details = _maybe_add_bevdet_depth_loss(loss, details, out, args)
+                loss, details = _maybe_add_dense_depth_loss(loss, details, out, args)
             else:
                 loss, details = criterion(out, target)
         loss_value = float(loss.detach())
@@ -513,6 +569,7 @@ def eval_one_epoch(
             elif args.exp == "bevdetocc_lidar":
                 loss, _details = criterion(out["ssc_logit"], target)
                 loss, _details = _maybe_add_bevdet_depth_loss(loss, _details, out, args)
+                loss, _details = _maybe_add_dense_depth_loss(loss, _details, out, args)
                 logits = out["ssc_logit"]
             else:
                 loss, _details = criterion(out, target)
@@ -618,8 +675,19 @@ def main():
         backbone_dtype=backbone_dtype,
     )
     if args.exp == "bevdetocc_lidar":
+        shared_geometry_enabled = args.shared_geometry_adapter
+        if shared_geometry_enabled is None:
+            shared_geometry_enabled = bool(args.dense_depth_supervision)
+        if bool(args.dense_depth_supervision) and not bool(shared_geometry_enabled):
+            raise ValueError(
+                "--dense_depth_supervision requires --shared_geometry_adapter; "
+                "otherwise dense depth would be a disconnected side branch."
+            )
+        args.shared_geometry_adapter = bool(shared_geometry_enabled)
         model_kwargs["fusion_attn_type"] = "cross"
         model_kwargs["num_frames"] = args.num_frames
+        model_kwargs["use_shared_geometry_adapter"] = args.shared_geometry_adapter
+        model_kwargs["geometry_channels"] = args.geometry_channels
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
         model_kwargs["fusion3d_enabled"] = args.fusion3d
@@ -645,6 +713,13 @@ def main():
         print(
             f"[depth_supervision] enabled={args.depth_supervision} "
             f"weight={args.depth_loss_weight}"
+        )
+        print(
+            f"[dense_depth] enabled={args.dense_depth_supervision} "
+            f"weight={args.dense_depth_loss_weight} "
+            f"range=[{args.dense_depth_min}, {args.dense_depth_max}] "
+            f"shared_geometry_adapter={model_kwargs.get('use_shared_geometry_adapter', False)} "
+            f"geometry_channels={args.geometry_channels}"
         )
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")

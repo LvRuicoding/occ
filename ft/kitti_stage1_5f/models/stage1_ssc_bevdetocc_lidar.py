@@ -48,6 +48,226 @@ class OccAnyTokenProjector(nn.Module):
         return x.view(B, N, C, H, W).contiguous()
 
 
+class GeometryResidualConvUnit(nn.Module):
+    """DPT-style residual conv unit for 2D geometry refinement."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        channels = int(channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.norm1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.norm2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.gelu(self.norm1(self.conv1(x)))
+        y = self.norm2(self.conv2(y))
+        return F.gelu(x + y)
+
+
+class GeometryFeatureFusionBlock(nn.Module):
+    """Top-down DPT-style feature fusion with optional upsampling."""
+
+    def __init__(
+        self,
+        channels: int,
+        has_residual: bool = True,
+        upsample: bool = True,
+    ) -> None:
+        super().__init__()
+        self.has_residual = bool(has_residual)
+        self.upsample = bool(upsample)
+        self.residual_unit = (
+            GeometryResidualConvUnit(channels) if self.has_residual else None
+        )
+        self.output_unit = GeometryResidualConvUnit(channels)
+        self.out_conv = nn.Conv2d(int(channels), int(channels), kernel_size=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if self.has_residual and residual is not None and self.residual_unit is not None:
+            x = x + self.residual_unit(residual)
+        x = self.output_unit(x)
+        if self.upsample:
+            if size is None:
+                x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            else:
+                x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+        return self.out_conv(x)
+
+
+class SharedGeometryAdapter(nn.Module):
+    """Shared 2D geometry adapter used by both dense depth and occupancy."""
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        geometry_channels: int = 256,
+        out_channels: int = 256,
+    ) -> None:
+        super().__init__()
+        in_channels = int(in_channels)
+        geometry_channels = int(geometry_channels)
+        out_channels = int(out_channels)
+
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(in_channels, geometry_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(geometry_channels),
+            nn.GELU(),
+        )
+        self.level1 = GeometryResidualConvUnit(geometry_channels)
+        self.level2 = nn.Sequential(
+            nn.Conv2d(
+                geometry_channels,
+                geometry_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(geometry_channels),
+            nn.GELU(),
+            GeometryResidualConvUnit(geometry_channels),
+        )
+        self.level3 = nn.Sequential(
+            nn.Conv2d(
+                geometry_channels,
+                geometry_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(geometry_channels),
+            nn.GELU(),
+            GeometryResidualConvUnit(geometry_channels),
+        )
+        self.level4 = nn.Sequential(
+            nn.Conv2d(
+                geometry_channels,
+                geometry_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(geometry_channels),
+            nn.GELU(),
+            GeometryResidualConvUnit(geometry_channels),
+        )
+
+        self.refine4 = GeometryFeatureFusionBlock(
+            geometry_channels, has_residual=False, upsample=True
+        )
+        self.refine3 = GeometryFeatureFusionBlock(
+            geometry_channels, has_residual=True, upsample=True
+        )
+        self.refine2 = GeometryFeatureFusionBlock(
+            geometry_channels, has_residual=True, upsample=True
+        )
+        self.refine1 = GeometryFeatureFusionBlock(
+            geometry_channels, has_residual=True, upsample=False
+        )
+        self.shared_out = GeometryResidualConvUnit(geometry_channels)
+        self.occ_guidance = nn.Sequential(
+            GeometryResidualConvUnit(geometry_channels),
+            nn.Conv2d(geometry_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        self.use_input_residual = in_channels == out_channels
+
+    def forward(self, feat_2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if feat_2d.ndim != 5:
+            raise RuntimeError(
+                f"feat_2d must be (B, N, C, H, W), got {tuple(feat_2d.shape)}."
+            )
+        B, N, C, H, W = feat_2d.shape
+        x = feat_2d.reshape(B * N, C, H, W).contiguous()
+
+        l1 = self.level1(self.input_proj(x))
+        l2 = self.level2(l1)
+        l3 = self.level3(l2)
+        l4 = self.level4(l3)
+
+        y = self.refine4(l4, size=l3.shape[-2:])
+        y = self.refine3(y, l3, size=l2.shape[-2:])
+        y = self.refine2(y, l2, size=l1.shape[-2:])
+        shared = self.shared_out(self.refine1(y, l1))
+
+        refined = self.occ_guidance(shared)
+        if self.use_input_residual:
+            refined = refined + x
+
+        C_refined = refined.shape[1]
+        C_shared = shared.shape[1]
+        refined = refined.view(B, N, C_refined, H, W).contiguous()
+        shared = shared.view(B, N, C_shared, H, W).contiguous()
+        return refined, shared
+
+
+class DenseDepthHead(nn.Module):
+    """Continuous dense depth head on top of shared geometry features."""
+
+    def __init__(self, in_channels: int = 256, hidden_channels: int = 128) -> None:
+        super().__init__()
+        in_channels = int(in_channels)
+        hidden_channels = int(hidden_channels)
+        mid_channels = max(hidden_channels // 4, 32)
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, 1, kernel_size=1),
+        )
+
+    @staticmethod
+    def _target_size(image_hw: torch.Tensor, fallback: Tuple[int, int]) -> Tuple[int, int]:
+        if image_hw is None:
+            return fallback
+        if image_hw.ndim == 3:
+            hw = image_hw[0, 0]
+        elif image_hw.ndim == 2:
+            hw = image_hw[0]
+        else:
+            hw = image_hw
+        return int(hw[0].item()), int(hw[1].item())
+
+    def forward(self, shared_geometry_feat: torch.Tensor, image_hw: torch.Tensor) -> torch.Tensor:
+        if shared_geometry_feat.ndim == 5:
+            B, N, C, H, W = shared_geometry_feat.shape
+            x = shared_geometry_feat.reshape(B * N, C, H, W).contiguous()
+        elif shared_geometry_feat.ndim == 4:
+            B, C, H, W = shared_geometry_feat.shape
+            N = None
+            x = shared_geometry_feat.contiguous()
+        else:
+            raise RuntimeError(
+                "shared_geometry_feat must be (B, C, H, W) or (B, N, C, H, W), got "
+                f"{tuple(shared_geometry_feat.shape)}."
+            )
+        depth_logits = self.head(x)
+        target_h, target_w = self._target_size(image_hw, fallback=(H, W))
+        if depth_logits.shape[-2:] != (target_h, target_w):
+            depth_logits = F.interpolate(
+                depth_logits,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        pred_depth = F.softplus(depth_logits) + 1e-3
+        if N is None:
+            return pred_depth.view(B, 1, target_h, target_w).contiguous()
+        return pred_depth.view(B, N, 1, target_h, target_w).contiguous()
+
+
 class LSSDepthLift(nn.Module):
     """Depth-distribution LSS lifting into each frame's own velo half-grid."""
 
@@ -352,6 +572,93 @@ def bevdet_depth_loss(
     return weighted_loss, raw_loss.detach(), valid_count.to(dtype=torch.float32)
 
 
+def dense_depth_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    has_dense_depth: Optional[torch.Tensor] = None,
+    min_depth: float = 1.0,
+    max_depth: float = 80.0,
+    loss_weight: float = 0.3,
+    si_weight: float = 0.05,
+    target_index: int = 0,
+    eps: float = 1e-3,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Masked continuous dense-depth loss on the target frame only."""
+    if pred_depth.ndim == 5:
+        pred = pred_depth[:, int(target_index), 0]
+    elif pred_depth.ndim == 4:
+        if pred_depth.shape[1] != 1:
+            raise RuntimeError(
+                f"4D pred_depth must be (B, 1, H, W), got {tuple(pred_depth.shape)}."
+            )
+        pred = pred_depth[:, 0]
+    elif pred_depth.ndim == 3:
+        pred = pred_depth
+    else:
+        raise RuntimeError(
+            "pred_depth must be (B,H,W), (B,1,H,W), or (B,N,1,H,W), got "
+            f"{tuple(pred_depth.shape)}."
+        )
+
+    gt = gt_depth
+    if gt.ndim == 5:
+        gt = gt[:, int(target_index), 0]
+    elif gt.ndim == 4:
+        if gt.shape[1] == 1:
+            gt = gt[:, 0]
+        else:
+            gt = gt[:, int(target_index)]
+    elif gt.ndim != 3:
+        raise RuntimeError(
+            f"gt_depth must be (B,H,W), (B,N,H,W), or (B,N,1,H,W), got {tuple(gt.shape)}."
+        )
+    if gt.shape != pred.shape:
+        raise RuntimeError(
+            f"dense depth GT shape {tuple(gt.shape)} does not match prediction {tuple(pred.shape)}."
+        )
+
+    device_type = pred.device.type
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        pred_f = pred.float().clamp(min=float(eps))
+        gt_f = gt.to(device=pred_f.device, dtype=torch.float32)
+        valid = (
+            torch.isfinite(pred_f)
+            & torch.isfinite(gt_f)
+            & (gt_f >= float(min_depth))
+            & (gt_f <= float(max_depth))
+        )
+        if has_dense_depth is not None:
+            has = has_dense_depth.to(device=pred_f.device, dtype=torch.bool)
+            if has.ndim == 2:
+                has = has[:, int(target_index)]
+            elif has.ndim != 1:
+                raise RuntimeError(
+                    "has_dense_depth must be (B,) or (B,N), got "
+                    f"{tuple(has_dense_depth.shape)}."
+                )
+            valid = valid & has.view(-1, 1, 1)
+
+        valid_count = valid.sum()
+        if not bool(valid_count.item()):
+            zero = pred_f.sum() * 0.0
+            return zero, zero.detach(), zero.detach(), valid_count.to(dtype=torch.float32)
+
+        log_diff = torch.log(pred_f[valid]) - torch.log(gt_f[valid].clamp(min=float(eps)))
+        log_l1 = log_diff.abs().mean()
+        if float(si_weight) > 0.0:
+            si_loss = (log_diff.square().mean() - log_diff.mean().square()).clamp(min=0.0)
+        else:
+            si_loss = log_l1 * 0.0
+        raw_loss = log_l1 + float(si_weight) * si_loss
+        weighted_loss = float(loss_weight) * raw_loss
+    return (
+        weighted_loss,
+        log_l1.detach(),
+        si_loss.detach(),
+        valid_count.to(dtype=torch.float32),
+    )
+
+
 class PerFrameLidarMemory(nn.Module):
     """Dense 32-channel LiDAR memory volume in each frame's velo coordinates."""
 
@@ -554,6 +861,8 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         fusion_attn_type: str = "cross",
         lss_in_channels: int = 256,
         lss_out_channels: int = 32,
+        use_shared_geometry_adapter: bool = False,
+        geometry_channels: int = 256,
         lidar_d_voxel: int = 128,
         lidar_hidden: int = 64,
         lidar_pe_num_freqs: int = 8,
@@ -607,6 +916,17 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             token_dim=token_dim,
             out_channels=lss_in_channels,
         )
+        self.use_shared_geometry_adapter = bool(use_shared_geometry_adapter)
+        if self.use_shared_geometry_adapter:
+            self.geometry_adapter = SharedGeometryAdapter(
+                in_channels=lss_in_channels,
+                geometry_channels=geometry_channels,
+                out_channels=lss_in_channels,
+            )
+            self.dense_depth_head = DenseDepthHead(in_channels=geometry_channels)
+        else:
+            self.geometry_adapter = None
+            self.dense_depth_head = None
         self.lss = LSSDepthLift(
             in_channels=lss_in_channels,
             out_channels=lss_out_channels,
@@ -689,6 +1009,9 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         image_hw: torch.Tensor,
         gt_depth: Optional[torch.Tensor] = None,
         return_depth: bool = False,
+        dense_depth_gt: Optional[torch.Tensor] = None,
+        has_dense_depth: Optional[torch.Tensor] = None,
+        return_dense_depth: bool = False,
     ) -> Dict[str, torch.Tensor]:
         backbone_out = self.backbone(views)
         t_rec_fused = self.fusion(
@@ -707,6 +1030,21 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             )
 
         feat_2d = self.token_projector(t_rec_fused)
+        shared_geometry_feat: Optional[torch.Tensor] = None
+        if self.geometry_adapter is not None:
+            feat_2d, shared_geometry_feat = self.geometry_adapter(feat_2d)
+        elif return_dense_depth:
+            raise RuntimeError(
+                "return_dense_depth=True requires use_shared_geometry_adapter=True."
+            )
+        pred_dense_depth: Optional[torch.Tensor] = None
+        if return_dense_depth:
+            if self.dense_depth_head is None or shared_geometry_feat is None:
+                raise RuntimeError("dense depth head is not initialized.")
+            pred_dense_depth = self.dense_depth_head(
+                shared_geometry_feat[:, 0],
+                image_hw.to(device=feat_2d.device),
+            )
         lss_volume, depth_logits = self.lss(
             feat_2d=feat_2d,
             K_per_frame=K_per_frame.to(device=feat_2d.device),
@@ -731,6 +1069,18 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         temporal = self.temporal_reduce(temporal)
         logits = self.occ_head(temporal)
         out: Dict[str, torch.Tensor] = {"ssc_logit": logits}
+        if return_dense_depth:
+            if pred_dense_depth is None:
+                raise RuntimeError("dense depth prediction was not computed.")
+            out["pred_dense_depth"] = pred_dense_depth
+            if dense_depth_gt is not None:
+                out["dense_depth_gt"] = dense_depth_gt.to(
+                    device=pred_dense_depth.device, dtype=torch.float32
+                )
+            if has_dense_depth is not None:
+                out["has_dense_depth"] = has_dense_depth.to(
+                    device=pred_dense_depth.device, dtype=torch.bool
+                )
         if return_depth:
             if gt_depth is None:
                 gt_depth = self.lss.build_depth_target(
@@ -751,4 +1101,8 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         return out
 
 
-__all__ = ["Stage1SSCBEVDetOccLidarModel"]
+__all__ = [
+    "Stage1SSCBEVDetOccLidarModel",
+    "bevdet_depth_loss",
+    "dense_depth_loss",
+]

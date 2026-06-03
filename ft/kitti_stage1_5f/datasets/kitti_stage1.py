@@ -99,6 +99,7 @@ class Kitti5FrameStage1Dataset(Dataset):
         frame_stride: int = 1,
         output_resolution: Tuple[int, int] = (512, 160),
         cam_idx: int = 0,
+        load_dense_depth: bool = False,
     ) -> None:
         super().__init__()
         if split not in KITTI_SPLITS:
@@ -109,6 +110,7 @@ class Kitti5FrameStage1Dataset(Dataset):
         self.frame_stride = int(frame_stride)
         self.output_resolution = (int(output_resolution[0]), int(output_resolution[1]))
         self.cam_idx = int(cam_idx)
+        self.load_dense_depth = bool(load_dense_depth)
 
         self.class_names: Tuple[str, ...] = KITTI_SSC_CLASS_NAMES
         self.n_classes = len(self.class_names)
@@ -202,15 +204,25 @@ class Kitti5FrameStage1Dataset(Dataset):
         # cam2world is kept around for debug/extension but not needed for lifting.
         cam2world = np.asarray(npz["cam2world"], dtype=np.float64)
 
-        place_holder_depth = np.zeros(image.shape[:2], dtype=np.float32)
+        load_view_dense_depth = self.load_dense_depth and int(timestep_index) == 0
+        has_dense_depth = load_view_dense_depth and "dense_depthmap" in npz.files
+        if load_view_dense_depth and has_dense_depth:
+            dense_depth = np.asarray(npz["dense_depthmap"], dtype=np.float32)
+            if dense_depth.shape != image.shape[:2]:
+                raise RuntimeError(
+                    f"dense_depthmap shape {dense_depth.shape} does not match "
+                    f"image shape {image.shape[:2]} for {self._frame_npz(seq, frame)}"
+                )
+        else:
+            dense_depth = np.zeros(image.shape[:2], dtype=np.float32)
         img_pil = Image.fromarray(image)
-        img_pil_out, _, intr_out = crop_resize_if_necessary(
-            img_pil, place_holder_depth, intrinsics, self.output_resolution
+        img_pil_out, dense_depth_out, intr_out = crop_resize_if_necessary(
+            img_pil, dense_depth, intrinsics, self.output_resolution
         )
         img_arr = np.asarray(img_pil_out)
         H, W = img_arr.shape[:2]
         img_tensor = ImgNorm(img_arr)  # (3, H, W) float in [-1, 1]
-        return dict(
+        view = dict(
             img=img_tensor,
             true_shape=np.int32((H, W)),
             camera_pose=np.eye(4, dtype=np.float32),
@@ -222,6 +234,10 @@ class Kitti5FrameStage1Dataset(Dataset):
             frame_id=int(frame),
             label=f"{seq}_{frame:06d}_cam{self.cam_idx}",
         )
+        if load_view_dense_depth:
+            view["dense_depth"] = np.asarray(dense_depth_out, dtype=np.float32)
+            view["has_dense_depth"] = bool(has_dense_depth)
+        return view
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         seq, t = self.samples[index]

@@ -1,0 +1,61 @@
+请实现一个 Shared Geometry Adapter + Dense Depth Head，用于 occupancy 网络中的 dense depth 辅助监督。
+
+1. 输入
+- 输入为 fusion 后的多相机 2D feature：
+  fusion_2d_feat: (B, N_cam, C, H, W)
+- 其中 B 是 batch size，N_cam 是相机数量，C 是通道数，H/W 是 2D feature 分辨率。
+
+2. 主干设定
+- occany backbone 已经冻结，不参与训练。
+- 训练时只更新 fusion module、Shared Geometry Adapter、Dense Depth Head、Occ Guidance Path、Voxel Update / Occ Head 等后续模块。
+
+3. Shared Geometry Adapter
+- 将 fusion_2d_feat reshape 为：
+  (B * N_cam, C, H, W)
+- 经过共享几何适配器，结构包括：
+  - 1x1 projection，将输入通道 C 映射到 geometry_channels。
+  - multi-scale feature builder，构造多尺度 2D feature。
+  - DA3 / DPT-style feature fusion blocks，用于几何特征 refinement。
+- 输出 shared_geometry_feat。
+- 该 shared_geometry_feat 是关键共享表征，不能只供 depth head 使用。
+
+4. Dense Depth Head 分支
+- 从 shared_geometry_feat 接 dense depth head。
+- 输出：
+  pred_depth: (B, N_cam, 1, H_img, W_img)
+- 可选输出：
+  depth_conf: (B, N_cam, 1, H_img, W_img)
+  或 depth_logits: (B, N_cam, D, H_img, W_img)
+- pred_depth 使用 softplus / sigmoid-range / exp 等方式保证深度为正。
+- 该分支使用 dense depth GT 进行监督。
+
+5. Occ Guidance 分支
+- shared_geometry_feat 同时进入 occ guidance path。
+- 经过 projection / refinement 后输出：
+  refined_2d_feat: (B, N_cam, C_g, H, W)
+- refined_2d_feat 必须继续送入后续 voxel update、2D-to-3D aggregation 或 occ head。
+- 这样 depth loss 的梯度会更新真正用于 occupancy 的共享几何特征。
+
+6. 后续 Occupancy 分支
+- 使用 refined_2d_feat 来送入原本的lss模块
+
+7. Loss 设计
+- 总 loss：
+  loss = loss_occ + lambda_depth * loss_depth
+- depth loss 可以包括：
+  - log-depth L1 loss
+  - scale-invariant depth loss
+  - gradient loss
+- 如果实现 depth_logits 分支，可以额外加入 depth bin classification loss。
+- 初始权重建议：
+  - loss_occ 权重为 1.0
+  - log-depth loss 权重为 0.3 到 0.5
+  - scale-invariant loss 权重为 0.05 到 0.1
+  - gradient loss 权重为 0.05 到 0.1
+  - depth bin classification loss 权重为 0.1 到 0.2
+
+8. 关键约束
+- depth head 不能是一个完全独立的旁路分支。
+- Dense depth supervision 必须作用在 shared_geometry_feat 上。
+- shared_geometry_feat 必须继续流入 occupancy 分支。
+- 目标是让 dense depth GT 改善 occupancy 所使用的几何表征，而不是只让 depth head 自己学好。
