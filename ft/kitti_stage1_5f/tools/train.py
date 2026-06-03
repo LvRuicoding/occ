@@ -64,6 +64,7 @@ from ..models import (
     Stage1SSCMonoModel,
     Stage1SSCMonoLidarModel,
 )
+from ..models.stage1_ssc_bevdetocc_lidar import bevdet_depth_loss
 
 
 LIDAR_EXPS = ("monoscene_lidar", "bevdetocc_lidar")
@@ -136,6 +137,10 @@ def get_args_parser() -> argparse.ArgumentParser:
                         "Required for LiDAR experiments.")
     p.add_argument("--max_points_per_sweep", type=int, default=0,
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
+    p.add_argument("--depth_supervision", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable BEVDet-style sparse LiDAR depth supervision for --exp=bevdetocc_lidar.")
+    p.add_argument("--depth_loss_weight", type=float, default=0.05,
+                   help="Weight for BEVDet-style LSS depth loss when --depth_supervision is enabled.")
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default="self",
                    help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
                         "'self' uses image+voxel window self-attention; 'cross' "
@@ -297,7 +302,17 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     """Dispatch the model forward to match each experiment's signature."""
     views = _move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
-    if args.exp in LIDAR_EXPS:
+    if args.exp == "bevdetocc_lidar":
+        return model(
+            views,
+            T_target_from_refcam,
+            _move_points_to_device(batch["points_per_frame"], device),
+            batch["T_cam_from_velo"].to(device, non_blocking=True),
+            batch["K_per_frame"].to(device, non_blocking=True),
+            batch["image_hw"].to(device, non_blocking=True),
+            return_depth=bool(getattr(args, "depth_supervision", False)),
+        )
+    if args.exp == "monoscene_lidar":
         return model(
             views,
             T_target_from_refcam,
@@ -307,6 +322,33 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             batch["image_hw"].to(device, non_blocking=True),
         )
     return model(views, T_target_from_refcam)
+
+
+def _maybe_add_bevdet_depth_loss(
+    loss: torch.Tensor,
+    details: Dict[str, float],
+    out: Dict,
+    args,
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    if args.exp != "bevdetocc_lidar" or not bool(getattr(args, "depth_supervision", False)):
+        return loss, details
+    if "depth_logits" not in out or "gt_depth" not in out:
+        raise RuntimeError(
+            "BEVDetOcc depth supervision expected model output to contain "
+            "'depth_logits' and 'gt_depth'."
+        )
+    depth_weighted, depth_raw, depth_valid = bevdet_depth_loss(
+        out["depth_logits"],
+        out["gt_depth"],
+        depth_start=float(out.get("depth_start", 1.0)),
+        depth_step=float(out.get("depth_step", 0.4)),
+        loss_weight=float(args.depth_loss_weight),
+    )
+    details = dict(details)
+    details["depth"] = float(depth_raw.detach())
+    details["depth_weighted"] = float(depth_weighted.detach())
+    details["depth_valid"] = float(depth_valid.detach())
+    return loss + depth_weighted, details
 
 
 def _sanitize_metric_key(name: str) -> str:
@@ -398,6 +440,7 @@ def train_one_epoch(
                 loss, details = criterion(out, target, cp)
             elif args.exp == "bevdetocc_lidar":
                 loss, details = criterion(out["ssc_logit"], target)
+                loss, details = _maybe_add_bevdet_depth_loss(loss, details, out, args)
             else:
                 loss, details = criterion(out, target)
         loss_value = float(loss.detach())
@@ -448,6 +491,7 @@ def eval_one_epoch(
         empty_class=0,
     )
     losses_total = 0.0
+    details_total: Dict[str, float] = {}
     n_batches = 0
     amp_dtype = (
         torch.bfloat16 if args.amp == "bf16" else (torch.float16 if args.amp == "fp16" else None)
@@ -468,11 +512,14 @@ def eval_one_epoch(
                 logits = out["ssc_logit"]
             elif args.exp == "bevdetocc_lidar":
                 loss, _details = criterion(out["ssc_logit"], target)
+                loss, _details = _maybe_add_bevdet_depth_loss(loss, _details, out, args)
                 logits = out["ssc_logit"]
             else:
                 loss, _details = criterion(out, target)
                 logits = out
         losses_total += float(loss.detach())
+        for k, v in _details.items():
+            details_total[k] = details_total.get(k, 0.0) + float(v)
         n_batches += 1
 
         pred = logits.argmax(dim=1).cpu().numpy()
@@ -494,6 +541,8 @@ def eval_one_epoch(
             return t.item()
 
         losses_total = _reduce_scalar(losses_total)
+        for k in sorted(details_total):
+            details_total[k] = _reduce_scalar(details_total[k])
         n_batches = int(_reduce_scalar(n_batches))
         ssc.tps = _reduce_np(ssc.tps)
         ssc.fps = _reduce_np(ssc.fps)
@@ -504,9 +553,12 @@ def eval_one_epoch(
 
     stats = ssc.get_stats()
     loss_avg = losses_total / max(n_batches, 1)
+    detail_avgs = {k: v / max(n_batches, 1) for k, v in details_total.items()}
     if log_writer is not None:
         it = 1000 * epoch
         log_writer.add_scalar("val/loss", loss_avg, it)
+        for k, v in detail_avgs.items():
+            log_writer.add_scalar(f"val/{k}", v, it)
         log_writer.add_scalar("val/iou", stats["iou"], it)
         log_writer.add_scalar("val/mIoU", stats["mIoU"], it)
         log_writer.add_scalar("val/precision", stats["precision"], it)
@@ -518,7 +570,7 @@ def eval_one_epoch(
         f"mIoU={stats['mIoU']*100:.2f} P={stats['precision']*100:.2f} "
         f"R={stats['recall']*100:.2f}"
     )
-    return dict(loss=loss_avg, **stats)
+    return dict(loss=loss_avg, **detail_avgs, **stats)
 
 
 def main():
@@ -590,6 +642,10 @@ def main():
     if args.exp == "bevdetocc_lidar":
         print("[fusion] attn_type=cross (forced for BEVDet-OCC LiDAR branch)")
         print("[backend] LSS half-grid -> LiDAR memory -> NATTEN -> BEVDet CustomResNet3D/LSSFPN3D")
+        print(
+            f"[depth_supervision] enabled={args.depth_supervision} "
+            f"weight={args.depth_loss_weight}"
+        )
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")
         print(

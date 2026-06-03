@@ -8,7 +8,9 @@ decoder tokens, then replaces the old lifting + MonoScene head with:
   temporal warp/concat -> BEVDet CustomResNet3D + LSSFPN3D ->
   full-grid upsample -> final_conv + predicter.
 
-The returned layout is always ``{"ssc_logit": (B, 20, X, Y, Z)}``.
+The returned layout always contains ``{"ssc_logit": (B, 20, X, Y, Z)}``.
+Training can also request BEVDet-style sparse LiDAR depth supervision targets
+for the LSS depth distribution branch.
 """
 from __future__ import annotations
 
@@ -59,6 +61,9 @@ class LSSDepthLift(nn.Module):
         grid_size: Tuple[int, int, int] = (128, 128, 16),
     ) -> None:
         super().__init__()
+        self.depth_start = float(depth_bound[0])
+        self.depth_end = float(depth_bound[1])
+        self.depth_step = float(depth_bound[2])
         depth_values = torch.arange(
             float(depth_bound[0]), float(depth_bound[1]), float(depth_bound[2])
         )
@@ -85,6 +90,88 @@ class LSSDepthLift(nn.Module):
                 bias=True,
             ),
         )
+
+    @torch.no_grad()
+    def build_depth_target(
+        self,
+        points_per_frame: List[List[torch.Tensor]],
+        K_per_frame: torch.Tensor,
+        T_cam_from_velo: torch.Tensor,
+        image_hw: torch.Tensor,
+        H_t: int,
+        W_t: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Project LiDAR points to the LSS feature grid and keep nearest depth.
+
+        This follows BEVDet's ``PointToMultiViewDepth.points2depthmap`` logic:
+        projected pixels are rounded to the downsampled grid and, when multiple
+        points hit the same cell, the nearest valid depth is kept.
+        """
+        B = len(points_per_frame)
+        if B == 0:
+            raise RuntimeError("points_per_frame must contain at least one sample.")
+        N = len(points_per_frame[0])
+        depth_maps = torch.zeros((B, N, H_t, W_t), device=device, dtype=torch.float32)
+
+        K = K_per_frame.to(device=device, dtype=torch.float32)
+        T = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        image_hw = image_hw.to(device=device, dtype=torch.float32)
+
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            for b in range(B):
+                img_h = image_hw[b, 0].clamp(min=1.0)
+                img_w = image_hw[b, 1].clamp(min=1.0)
+                scale_x = img_w / float(W_t)
+                scale_y = img_h / float(H_t)
+                R = T[b, :3, :3]
+                t = T[b, :3, 3]
+                for f in range(N):
+                    pts = points_per_frame[b][f]
+                    if pts.numel() == 0:
+                        continue
+                    pts_xyz = pts.to(device=device, dtype=torch.float32)[:, :3]
+                    pts_cam = pts_xyz @ R.T + t
+                    depth = pts_cam[:, 2]
+                    valid_z = torch.isfinite(pts_cam).all(dim=1) & (depth > 1e-6)
+                    if not bool(valid_z.any().item()):
+                        continue
+
+                    pts_cam = pts_cam[valid_z]
+                    depth = depth[valid_z]
+                    K_bf = K[b, f]
+                    u = pts_cam[:, 0] / depth * K_bf[0, 0] + K_bf[0, 2]
+                    v = pts_cam[:, 1] / depth * K_bf[1, 1] + K_bf[1, 2]
+                    coor_x = torch.round(u / scale_x)
+                    coor_y = torch.round(v / scale_y)
+                    valid = (
+                        torch.isfinite(coor_x)
+                        & torch.isfinite(coor_y)
+                        & (coor_x >= 0)
+                        & (coor_x < W_t)
+                        & (coor_y >= 0)
+                        & (coor_y < H_t)
+                        & (depth >= self.depth_start)
+                        & (depth < self.depth_end)
+                    )
+                    if not bool(valid.any().item()):
+                        continue
+
+                    coor_x = coor_x[valid].long()
+                    coor_y = coor_y[valid].long()
+                    depth = depth[valid]
+                    ranks = coor_x + coor_y * W_t
+                    order = (ranks.to(torch.float32) + depth / 100.0).argsort()
+                    ranks = ranks[order]
+                    coor_x = coor_x[order]
+                    coor_y = coor_y[order]
+                    depth = depth[order]
+
+                    keep = torch.ones_like(ranks, dtype=torch.bool)
+                    keep[1:] = ranks[1:] != ranks[:-1]
+                    depth_maps[b, f, coor_y[keep], coor_x[keep]] = depth[keep]
+
+        return depth_maps
 
     @staticmethod
     def _pixel_centers(
@@ -162,7 +249,7 @@ class LSSDepthLift(nn.Module):
         image_hw: torch.Tensor,      # (B, 2)
         gt_depth: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del gt_depth  # Reserved for future sparse depth supervision.
+        del gt_depth  # Depth supervision is computed outside the lift operator.
 
         B, N, C, H_t, W_t = feat_2d.shape
         Gx, Gy, Gz = self.grid_size
@@ -211,6 +298,58 @@ class LSSDepthLift(nn.Module):
 
         depth_logits = depth_logits.view(B, N, self.depth_channels, H_t, W_t)
         return volumes, depth_logits
+
+
+def bevdet_depth_loss(
+    depth_logits: torch.Tensor,
+    gt_depth: torch.Tensor,
+    depth_start: float = 1.0,
+    depth_step: float = 0.4,
+    loss_weight: float = 0.05,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BEVDet-style one-hot depth BCE over valid LiDAR-projected cells.
+
+    ``gt_depth`` is a sparse raw-depth map with zeros for empty cells. The
+    discretization mirrors BEVDet's ``get_downsampled_gt_depth`` for linear
+    depth bins: class 0 is the ignored/no-depth bin and is removed before BCE.
+    """
+    if depth_logits.ndim != 5:
+        raise RuntimeError(
+            f"depth_logits must be (B, N, D, H, W), got {tuple(depth_logits.shape)}."
+        )
+    expected_shape = (
+        depth_logits.shape[0],
+        depth_logits.shape[1],
+        depth_logits.shape[3],
+        depth_logits.shape[4],
+    )
+    if gt_depth.shape != expected_shape:
+        raise RuntimeError(
+            f"gt_depth shape {tuple(gt_depth.shape)} does not match depth_logits "
+            f"{tuple(depth_logits.shape)}."
+        )
+
+    device_type = depth_logits.device.type
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        logits = depth_logits.float()
+        gt = gt_depth.to(device=logits.device, dtype=torch.float32)
+        D = logits.shape[2]
+        depth_labels = (gt - (float(depth_start) - float(depth_step))) / float(depth_step)
+        valid = (gt > 0.0) & (depth_labels >= 1.0) & (depth_labels < float(D + 1))
+        valid_count = valid.sum()
+        if not bool(valid_count.item()):
+            zero = logits.sum() * 0.0
+            return zero, zero.detach(), valid_count.to(dtype=torch.float32)
+
+        label_ids = depth_labels.long().clamp(min=0, max=D)
+        labels = F.one_hot(label_ids, num_classes=D + 1)[..., 1:].float()
+        preds = logits.softmax(dim=2).permute(0, 1, 3, 4, 2).contiguous()
+        labels = labels[valid]
+        preds = preds[valid].clamp(min=1e-6, max=1.0 - 1e-6)
+        raw_loss = F.binary_cross_entropy(preds, labels, reduction="none").sum()
+        raw_loss = raw_loss / valid_count.clamp(min=1).to(dtype=torch.float32)
+        weighted_loss = float(loss_weight) * raw_loss
+    return weighted_loss, raw_loss.detach(), valid_count.to(dtype=torch.float32)
 
 
 class PerFrameLidarMemory(nn.Module):
@@ -549,6 +688,7 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         K_per_frame: torch.Tensor,
         image_hw: torch.Tensor,
         gt_depth: Optional[torch.Tensor] = None,
+        return_depth: bool = False,
     ) -> Dict[str, torch.Tensor]:
         backbone_out = self.backbone(views)
         t_rec_fused = self.fusion(
@@ -567,7 +707,7 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             )
 
         feat_2d = self.token_projector(t_rec_fused)
-        lss_volume, _depth_logits = self.lss(
+        lss_volume, depth_logits = self.lss(
             feat_2d=feat_2d,
             K_per_frame=K_per_frame.to(device=feat_2d.device),
             T_cam_from_velo=T_cam_from_velo.to(device=feat_2d.device),
@@ -590,7 +730,25 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         temporal = warped.view(B, N * C, X, Y, Z)
         temporal = self.temporal_reduce(temporal)
         logits = self.occ_head(temporal)
-        return {"ssc_logit": logits}
+        out: Dict[str, torch.Tensor] = {"ssc_logit": logits}
+        if return_depth:
+            if gt_depth is None:
+                gt_depth = self.lss.build_depth_target(
+                    points_per_frame=points_per_frame,
+                    K_per_frame=K_per_frame,
+                    T_cam_from_velo=T_cam_from_velo,
+                    image_hw=image_hw,
+                    H_t=depth_logits.shape[-2],
+                    W_t=depth_logits.shape[-1],
+                    device=depth_logits.device,
+                )
+            out.update(
+                depth_logits=depth_logits,
+                gt_depth=gt_depth.to(device=depth_logits.device, dtype=torch.float32),
+                depth_start=self.lss.depth_start,
+                depth_step=self.lss.depth_step,
+            )
+        return out
 
 
 __all__ = ["Stage1SSCBEVDetOccLidarModel"]
