@@ -13,6 +13,11 @@ from .lidar_fusion import (
 )
 from .stage1_ssc_mono_lidar import Stage1SSCMonoLidarModel
 from .stage1_ssc_bevdetocc_lidar import Stage1SSCBEVDetOccLidarModel
+from .stage1_ssc_bevdetocc_lidar_dense_depth import (
+    SingleScaleDPTDepthHead,
+    Stage1SSCBEVDetOccLidarDenseDepthModel,
+    dense_metric_depth_loss,
+)
 
 __all__ = [
     "OccAnyRecon5FrameBackbone",
@@ -24,6 +29,9 @@ __all__ = [
     "Stage1SSCMonoModel",
     "Stage1SSCMonoLidarModel",
     "Stage1SSCBEVDetOccLidarModel",
+    "Stage1SSCBEVDetOccLidarDenseDepthModel",
+    "SingleScaleDPTDepthHead",
+    "dense_metric_depth_loss",
     "LidarImageFusionModule",
     "Sorted3DTokenFusionLayer",
     "VoxelFeatureEncoder",

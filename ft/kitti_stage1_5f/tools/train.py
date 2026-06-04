@@ -49,25 +49,30 @@ from ft.semantickitti_ft.losses import SSCLoss
 from ..datasets import (
     KITTI_SSC_CLASS_NAMES,
     Kitti5FrameStage1Dataset,
+    Kitti5FrameStage1LidarDenseDepthDataset,
     Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoDataset,
     Kitti5FrameStage1MonoLidarDataset,
     collate_stage1,
+    collate_stage1_lidar_dense_depth,
     collate_stage1_lidar,
     collate_stage1_mono,
     collate_stage1_mono_lidar,
 )
 from ..losses_monoscene import MonoSceneSSCLoss
 from ..models import (
+    Stage1SSCBEVDetOccLidarDenseDepthModel,
     Stage1SSCBEVDetOccLidarModel,
     Stage1SSCModel,
     Stage1SSCMonoModel,
     Stage1SSCMonoLidarModel,
 )
+from ..models.stage1_ssc_bevdetocc_lidar_dense_depth import dense_metric_depth_loss
 from ..models.stage1_ssc_bevdetocc_lidar import bevdet_depth_loss
 
 
-LIDAR_EXPS = ("monoscene_lidar", "bevdetocc_lidar")
+BEVDETOCC_LIDAR_EXPS = ("bevdetocc_lidar", "bevdetocc_lidar_dense_depth")
+LIDAR_EXPS = ("monoscene_lidar", *BEVDETOCC_LIDAR_EXPS)
 MONOSCENE_LOSS_EXPS = ("monoscene", "monoscene_lidar")
 
 
@@ -117,9 +122,19 @@ def get_args_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Freeze the OccAny backbone. Defaults to false for "
-            "--exp=bevdetocc_lidar and true for other variants; pass "
+            "Freeze the OccAny backbone. Defaults to false for BEVDet-OCC "
+            "LiDAR variants and true for other variants; pass "
             "--freeze_backbone to restore the original BEVDet-OCC LiDAR behavior."
+        ),
+    )
+    p.add_argument(
+        "--freeze_backbone_epochs",
+        type=int,
+        default=5,
+        help=(
+            "For full fine-tuning BEVDet-OCC LiDAR variants, keep the loaded "
+            "OccAny backbone frozen for the first K epochs, then unfreeze. "
+            "Ignored when --freeze_backbone is set."
         ),
     )
 
@@ -136,9 +151,17 @@ def get_args_parser() -> argparse.ArgumentParser:
     #   - "bevdetocc_lidar": keep the first 2D LiDAR/image cross-attention,
     #                         then use LSS + LiDAR memory + NATTEN + BEVDet-OCC
     #                         3D encoder/head. Requires --velodyne_root.
+    #   - "bevdetocc_lidar_dense_depth": same as bevdetocc_lidar plus a
+    #                         post-2D-fusion DPT-style dense depth head.
     p.add_argument(
         "--exp",
-        choices=["light", "monoscene", "monoscene_lidar", "bevdetocc_lidar"],
+        choices=[
+            "light",
+            "monoscene",
+            "monoscene_lidar",
+            "bevdetocc_lidar",
+            "bevdetocc_lidar_dense_depth",
+        ],
         default="light",
     )
     # LiDAR-fusion-only options.
@@ -148,9 +171,15 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_points_per_sweep", type=int, default=0,
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
     p.add_argument("--depth_supervision", action=argparse.BooleanOptionalAction, default=True,
-                   help="Enable BEVDet-style sparse LiDAR depth supervision for --exp=bevdetocc_lidar.")
+                   help="Enable BEVDet-style sparse LiDAR depth supervision for BEVDet-OCC LiDAR variants.")
     p.add_argument("--depth_loss_weight", type=float, default=0.05,
                    help="Weight for BEVDet-style LSS depth loss when --depth_supervision is enabled.")
+    p.add_argument("--dense_depth_supervision", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable dense metric depth auxiliary supervision for --exp=bevdetocc_lidar_dense_depth.")
+    p.add_argument("--dense_depth_loss_weight", type=float, default=0.1,
+                   help="Weight for dense metric depth auxiliary loss.")
+    p.add_argument("--dense_depth_features", type=int, default=128,
+                   help="Feature width for the single-scale DPT-style dense depth head.")
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default="self",
                    help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
                         "'self' uses image+voxel window self-attention; 'cross' "
@@ -208,6 +237,14 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
         output_resolution=(args.width, args.height),
         cam_idx=0,
     )
+    if args.exp == "bevdetocc_lidar_dense_depth":
+        if not args.velodyne_root:
+            raise ValueError("--velodyne_root is required when --exp=bevdetocc_lidar_dense_depth")
+        return Kitti5FrameStage1LidarDenseDepthDataset(
+            velodyne_root=args.velodyne_root,
+            max_points_per_sweep=args.max_points_per_sweep,
+            **common,
+        )
     if args.exp == "bevdetocc_lidar":
         if not args.velodyne_root:
             raise ValueError("--velodyne_root is required when --exp=bevdetocc_lidar")
@@ -230,6 +267,8 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
 
 
 def _collate_fn(args):
+    if args.exp == "bevdetocc_lidar_dense_depth":
+        return collate_stage1_lidar_dense_depth
     if args.exp == "bevdetocc_lidar":
         return collate_stage1_lidar
     if args.exp == "monoscene_lidar":
@@ -285,6 +324,29 @@ def _state_dict_without_backbone(model: nn.Module) -> Dict[str, torch.Tensor]:
     }
 
 
+def _backbone_frozen_for_epoch(args, epoch: int) -> bool:
+    """Return whether the OccAny backbone should be frozen at this epoch."""
+    if args.exp not in BEVDETOCC_LIDAR_EXPS:
+        return True
+    if bool(args.freeze_backbone):
+        return True
+    return int(getattr(args, "freeze_backbone_epochs", 0)) > 0 and epoch < int(
+        args.freeze_backbone_epochs
+    )
+
+
+def _apply_backbone_freeze_state(model: nn.Module, args, epoch: int) -> bool:
+    """Apply permanent or staged BEVDet-OCC backbone freezing."""
+    frozen = _backbone_frozen_for_epoch(args, epoch)
+    if args.exp in BEVDETOCC_LIDAR_EXPS:
+        if hasattr(model, "set_freeze_backbone"):
+            model.set_freeze_backbone(frozen)
+        else:
+            for p in model.backbone.parameters():
+                p.requires_grad = not frozen
+    return frozen
+
+
 def _move_views_to_device(views: List[Dict[str, torch.Tensor]], device: torch.device):
     moved: List[Dict[str, torch.Tensor]] = []
     for v in views:
@@ -312,7 +374,7 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     """Dispatch the model forward to match each experiment's signature."""
     views = _move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
-    if args.exp == "bevdetocc_lidar":
+    if args.exp in BEVDETOCC_LIDAR_EXPS:
         return model(
             views,
             T_target_from_refcam,
@@ -340,7 +402,7 @@ def _maybe_add_bevdet_depth_loss(
     out: Dict,
     args,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
-    if args.exp != "bevdetocc_lidar" or not bool(getattr(args, "depth_supervision", False)):
+    if args.exp not in BEVDETOCC_LIDAR_EXPS or not bool(getattr(args, "depth_supervision", False)):
         return loss, details
     if "depth_logits" not in out or "gt_depth" not in out:
         raise RuntimeError(
@@ -359,6 +421,38 @@ def _maybe_add_bevdet_depth_loss(
     details["depth_weighted"] = float(depth_weighted.detach())
     details["depth_valid"] = float(depth_valid.detach())
     return loss + depth_weighted, details
+
+
+def _maybe_add_dense_depth_loss(
+    loss: torch.Tensor,
+    details: Dict[str, float],
+    out: Dict,
+    batch: Dict,
+    args,
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    if args.exp != "bevdetocc_lidar_dense_depth" or not bool(
+        getattr(args, "dense_depth_supervision", False)
+    ):
+        return loss, details
+    if "dense_depth" not in out:
+        raise RuntimeError("Dense depth supervision expected model output key 'dense_depth'.")
+    dense_gt = batch["dense_depth"].to(device=out["dense_depth"].device, non_blocking=True)
+    frame_mask = batch["dense_depth_frame_mask"].to(
+        device=out["dense_depth"].device,
+        non_blocking=True,
+    )
+    dense_weighted, dense_raw, dense_valid, dense_frames = dense_metric_depth_loss(
+        out["dense_depth"],
+        dense_gt,
+        frame_mask=frame_mask,
+        loss_weight=float(args.dense_depth_loss_weight),
+    )
+    details = dict(details)
+    details["dense_depth"] = float(dense_raw.detach())
+    details["dense_depth_weighted"] = float(dense_weighted.detach())
+    details["dense_depth_valid"] = float(dense_valid.detach())
+    details["dense_depth_frames"] = float(dense_frames.detach())
+    return loss + dense_weighted, details
 
 
 def _sanitize_metric_key(name: str) -> str:
@@ -448,9 +542,10 @@ def train_one_epoch(
             if args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, details = criterion(out, target, cp)
-            elif args.exp == "bevdetocc_lidar":
+            elif args.exp in BEVDETOCC_LIDAR_EXPS:
                 loss, details = criterion(out["ssc_logit"], target)
                 loss, details = _maybe_add_bevdet_depth_loss(loss, details, out, args)
+                loss, details = _maybe_add_dense_depth_loss(loss, details, out, batch, args)
             else:
                 loss, details = criterion(out, target)
         loss_value = float(loss.detach())
@@ -520,9 +615,10 @@ def eval_one_epoch(
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, _details = criterion(out, target, cp)
                 logits = out["ssc_logit"]
-            elif args.exp == "bevdetocc_lidar":
+            elif args.exp in BEVDETOCC_LIDAR_EXPS:
                 loss, _details = criterion(out["ssc_logit"], target)
                 loss, _details = _maybe_add_bevdet_depth_loss(loss, _details, out, args)
+                loss, _details = _maybe_add_dense_depth_loss(loss, _details, out, batch, args)
                 logits = out["ssc_logit"]
             else:
                 loss, _details = criterion(out, target)
@@ -586,10 +682,13 @@ def eval_one_epoch(
 def main():
     args = get_args_parser().parse_args()
     if args.freeze_backbone is None:
-        args.freeze_backbone = args.exp != "bevdetocc_lidar"
-    if args.exp != "bevdetocc_lidar" and not args.freeze_backbone:
+        args.freeze_backbone = args.exp not in BEVDETOCC_LIDAR_EXPS
+    args.freeze_backbone_epochs = int(args.freeze_backbone_epochs)
+    if args.freeze_backbone_epochs < 0:
+        raise ValueError("--freeze_backbone_epochs must be >= 0.")
+    if args.exp not in BEVDETOCC_LIDAR_EXPS and not args.freeze_backbone:
         raise ValueError(
-            "--no-freeze_backbone is currently only supported for --exp=bevdetocc_lidar."
+            "--no-freeze_backbone is currently only supported for BEVDet-OCC LiDAR variants."
         )
 
     misc.init_distributed_mode_jz(args)
@@ -617,7 +716,9 @@ def main():
     else:
         backbone_dtype = torch.float32
 
-    if args.exp == "bevdetocc_lidar":
+    if args.exp == "bevdetocc_lidar_dense_depth":
+        model_cls = Stage1SSCBEVDetOccLidarDenseDepthModel
+    elif args.exp == "bevdetocc_lidar":
         model_cls = Stage1SSCBEVDetOccLidarModel
     elif args.exp == "monoscene_lidar":
         model_cls = Stage1SSCMonoLidarModel
@@ -634,10 +735,12 @@ def main():
         backbone_img_size=(args.height, args.width),
         backbone_dtype=backbone_dtype,
     )
-    if args.exp == "bevdetocc_lidar":
+    if args.exp in BEVDETOCC_LIDAR_EXPS:
         model_kwargs["fusion_attn_type"] = "cross"
         model_kwargs["num_frames"] = args.num_frames
         model_kwargs["freeze_backbone"] = args.freeze_backbone
+    if args.exp == "bevdetocc_lidar_dense_depth":
+        model_kwargs["dense_depth_features"] = args.dense_depth_features
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
         model_kwargs["fusion3d_enabled"] = args.fusion3d
@@ -657,13 +760,19 @@ def main():
         model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
-    if args.exp == "bevdetocc_lidar":
+    if args.exp in BEVDETOCC_LIDAR_EXPS:
         print("[fusion] attn_type=cross (forced for BEVDet-OCC LiDAR branch)")
         print("[backend] LSS half-grid -> LiDAR memory -> NATTEN -> BEVDet CustomResNet3D/LSSFPN3D")
         print(
             f"[depth_supervision] enabled={args.depth_supervision} "
             f"weight={args.depth_loss_weight}"
         )
+        if args.exp == "bevdetocc_lidar_dense_depth":
+            print(
+                f"[dense_depth] enabled={args.dense_depth_supervision} "
+                f"weight={args.dense_depth_loss_weight} "
+                f"features={args.dense_depth_features}"
+            )
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")
         print(
@@ -682,8 +791,10 @@ def main():
             f"alpha_init={args.memory_voxel_alpha_init}"
         )
 
-    # Freeze the OccAny backbone unless full fine-tuning is requested for the
-    # BEVDet-OCC LiDAR branch. Trainable params in frozen mode:
+    # Freeze the OccAny backbone unless full fine-tuning is requested. For
+    # BEVDet-OCC full fine-tuning, optimizer params remain visible so staged
+    # freezing can unfreeze the backbone after --freeze_backbone_epochs.
+    # Trainable params in frozen mode:
     #   light:            lifting + occ_head
     #   monoscene:        lifting + occ_head (incl. monoscene adapter)
     #   monoscene_lidar:  lifting + occ_head + fusion
@@ -696,6 +807,11 @@ def main():
         _state_dict_hash(model.backbone.state_dict()) if args.freeze_backbone else None
     )
     print(f"[backbone] freeze={args.freeze_backbone}")
+    if args.exp in BEVDETOCC_LIDAR_EXPS and not args.freeze_backbone:
+        print(
+            f"[backbone] staged_freeze_epochs={args.freeze_backbone_epochs} "
+            "(0 disables staged freezing)"
+        )
     if backbone_hash is not None:
         print(f"Backbone state_dict hash: {backbone_hash}")
     else:
@@ -708,7 +824,10 @@ def main():
     # without this step. Light head uses GroupNorm so it's unaffected.
     syncbn_on = args.distributed and (
         args.syncbn == "on"
-        or (args.syncbn == "auto" and args.exp in ("monoscene", "monoscene_lidar", "bevdetocc_lidar"))
+        or (
+            args.syncbn == "auto"
+            and args.exp in ("monoscene", "monoscene_lidar", *BEVDETOCC_LIDAR_EXPS)
+        )
     )
     if syncbn_on:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -770,17 +889,17 @@ def main():
                 f"checkpoint expected {prev_hash}, current --occany_ckpt gives {backbone_hash}. "
                 "Refusing to resume — the frozen backbone has changed."
             )
-        if args.exp == "bevdetocc_lidar" and "model" in ckpt:
+        if args.exp in BEVDETOCC_LIDAR_EXPS and "model" in ckpt:
             status = model_to_save.load_state_dict(ckpt["model"], strict=False)
             print(
-                "[resume:bevdetocc_lidar] loaded model state: "
+                f"[resume:{args.exp}] loaded model state: "
                 f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
             )
-        elif args.exp != "bevdetocc_lidar" and "lifting" in ckpt:
+        elif args.exp not in BEVDETOCC_LIDAR_EXPS and "lifting" in ckpt:
             model_to_save.lifting.load_state_dict(ckpt["lifting"], strict=False)
-        if args.exp != "bevdetocc_lidar" and "occ_head" in ckpt:
+        if args.exp not in BEVDETOCC_LIDAR_EXPS and "occ_head" in ckpt:
             model_to_save.occ_head.load_state_dict(ckpt["occ_head"], strict=False)
-        if args.exp != "bevdetocc_lidar" and "fusion" in ckpt and hasattr(model_to_save, "fusion"):
+        if args.exp not in BEVDETOCC_LIDAR_EXPS and "fusion" in ckpt and hasattr(model_to_save, "fusion"):
             model_to_save.fusion.load_state_dict(ckpt["fusion"], strict=False)
         if (
             "post_lift_lidar" in ckpt
@@ -823,7 +942,15 @@ def main():
 
     print(f"Start training: epochs={args.epochs}, start_epoch={start_epoch}")
     t0 = time.time()
+    last_backbone_frozen = None
     for epoch in range(start_epoch, args.epochs):
+        if args.exp in BEVDETOCC_LIDAR_EXPS:
+            backbone_frozen = _apply_backbone_freeze_state(model_to_save, args, epoch)
+            if backbone_frozen != last_backbone_frozen:
+                phase = "permanent" if args.freeze_backbone else "staged"
+                print(f"[backbone] epoch={epoch} freeze={backbone_frozen} ({phase})")
+            last_backbone_frozen = backbone_frozen
+
         train_stats = train_one_epoch(
             model, train_loader, optimizer, loss_scaler, criterion, device, epoch, args, log_writer
         )
@@ -835,7 +962,7 @@ def main():
             )
 
         if misc.is_main_process():
-            if args.exp == "bevdetocc_lidar":
+            if args.exp in BEVDETOCC_LIDAR_EXPS:
                 model_state = (
                     _state_dict_without_backbone(model_to_save)
                     if args.freeze_backbone
@@ -875,7 +1002,7 @@ def main():
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
-                if args.exp == "bevdetocc_lidar":
+                if args.exp in BEVDETOCC_LIDAR_EXPS:
                     keep_payload = {
                         "model": ckpt_payload["model"],
                         "epoch": epoch,

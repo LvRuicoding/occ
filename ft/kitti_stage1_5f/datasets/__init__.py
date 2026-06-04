@@ -17,6 +17,10 @@ from .kitti_stage1_mono_lidar import (
     collate_stage1_lidar,
     collate_stage1_mono_lidar,
 )
+from .kitti_stage1_lidar_dense_depth import (
+    Kitti5FrameStage1LidarDenseDepthDataset,
+    collate_stage1_lidar_dense_depth,
+)
 
 __all__ = [
     "KITTI_SSC_CLASS_NAMES",
@@ -30,4 +34,6 @@ __all__ = [
     "Kitti5FrameStage1MonoLidarDataset",
     "collate_stage1_lidar",
     "collate_stage1_mono_lidar",
+    "Kitti5FrameStage1LidarDenseDepthDataset",
+    "collate_stage1_lidar_dense_depth",
 ]
