@@ -1,7 +1,7 @@
-"""Stage-1 lifting: frozen OccAny recon backbone + confidence-weighted voxel lift.
+"""Stage-1 lifting: configurable OccAny recon backbone + confidence-weighted voxel lift.
 
 Implements stage1.txt:
-- Frozen Dust3rEncoder + Must3rDecoder run once on 5 frames (target frame
+- Dust3rEncoder + Must3rDecoder run once on 5 frames (target frame
   first → reconstruction reference). Outputs T_rec (patch tokens),
   P_rec_global (pixel pointmaps in refcam coords), C_rec (pixel confidence).
 - Pixel feature MLP consumes nearest-upsampled T_rec concatenated with
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from .. import _paths  # noqa: F401
 
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -36,13 +37,13 @@ class _DecoderNormCapturer:
     the first token along N is the pose token.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, detach_output: bool = True) -> None:
         self._handle = None
         self._captured: Optional[torch.Tensor] = None
+        self.detach_output = bool(detach_output)
 
     def _hook(self, module, inputs, output):
-        # Detach immediately — backbone is frozen and we never need gradients.
-        self._captured = output.detach()
+        self._captured = output.detach() if self.detach_output else output
 
     def attach(self, norm_module: nn.Module) -> None:
         if self._handle is not None:
@@ -64,7 +65,7 @@ class _DecoderNormCapturer:
 
 
 class OccAnyRecon5FrameBackbone(nn.Module):
-    """Frozen OccAny reconstruction encoder + decoder for 5 (or N) frames.
+    """OccAny reconstruction encoder + decoder for 5 (or N) frames.
 
     The first view passed in `forward(views)` is the reconstruction reference;
     the rest are joined via Must3rDecoder's joint pass. `p_rec_global` is in
@@ -81,11 +82,13 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         embed_dim: int = 768,
         patch_size: int = 16,
         backbone_dtype: torch.dtype = torch.bfloat16,
+        freeze: bool = True,
     ) -> None:
         super().__init__()
         self.patch_size = int(patch_size)
         self.embed_dim = int(embed_dim)
         self.backbone_dtype = backbone_dtype
+        self.freeze = bool(freeze)
 
         self.encoder = Dust3rEncoder()
         self.decoder = Must3rDecoder(
@@ -100,18 +103,26 @@ class OccAnyRecon5FrameBackbone(nn.Module):
             use_multitask_token=True,
         )
 
+        self._capturer = _DecoderNormCapturer(detach_output=self.freeze)
+        self.set_frozen(self.freeze)
+
+    def set_frozen(self, freeze: bool = True) -> None:
+        self.freeze = bool(freeze)
+        self._capturer.detach_output = self.freeze
         for p in self.parameters():
-            p.requires_grad = False
-        self.encoder.eval()
-        self.decoder.eval()
+            p.requires_grad = not self.freeze
+        if self.freeze:
+            self.encoder.eval()
+            self.decoder.eval()
+        else:
+            self.encoder.train(self.training)
+            self.decoder.train(self.training)
 
-        self._capturer = _DecoderNormCapturer()
-
-    # Keep the backbone in eval mode regardless of outer .train() calls.
     def train(self, mode: bool = True):
         super().train(mode)
-        self.encoder.eval()
-        self.decoder.eval()
+        if self.freeze:
+            self.encoder.eval()
+            self.decoder.eval()
         return self
 
     def load_checkpoint(self, ckpt_path: str) -> None:
@@ -133,7 +144,6 @@ class OccAnyRecon5FrameBackbone(nn.Module):
                 print(f"[OccAnyRecon5FrameBackbone] pointmaps_activation set to {pm_act}")
         del ckpt
 
-    @torch.no_grad()
     def forward(
         self,
         views: List[Dict[str, torch.Tensor]],
@@ -142,7 +152,8 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         if device is None:
             device = views[0]["img"].device
 
-        with torch.autocast("cuda", dtype=self.backbone_dtype):
+        grad_context = torch.no_grad() if self.freeze else nullcontext()
+        with grad_context, torch.autocast("cuda", dtype=self.backbone_dtype):
             imgs, true_shape, _mem_batches, _timesteps = (
                 prepare_imgs_or_raymaps_and_true_shape_mem_batches(
                     views, device, is_raymap=False
@@ -155,7 +166,7 @@ class OccAnyRecon5FrameBackbone(nn.Module):
                 imgs=imgs,
                 true_shape_view=true_shape.view(B * nimgs, 2),
                 max_bs=None,
-                requires_grad=False,
+                requires_grad=not self.freeze,
             )
 
             # Joint decoder pass: first frame is reference (no image2_embed),
@@ -199,14 +210,21 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         dense = dense_with_pose[:, 1:, :].float()           # drop pose token
         t_rec = dense.view(B, nimgs, H_t, W_t, D).contiguous()
 
-        p_rec_global = post["pts3d"].float().detach()       # (B, nimgs, H_p, W_p, 3)
+        p_rec_global = post["pts3d"].float()                # (B, nimgs, H_p, W_p, 3)
         p_rec_local = post.get("pts3d_local", None)
         if p_rec_local is not None:
-            p_rec_local = p_rec_local.float().detach()      # (B, nimgs, H_p, W_p, 3)
-        c_rec = post["conf"].float().detach()               # (B, nimgs, H_p, W_p)
+            p_rec_local = p_rec_local.float()               # (B, nimgs, H_p, W_p, 3)
+        c_rec = post["conf"].float()                        # (B, nimgs, H_p, W_p)
+
+        if self.freeze:
+            t_rec = t_rec.detach()
+            p_rec_global = p_rec_global.detach()
+            if p_rec_local is not None:
+                p_rec_local = p_rec_local.detach()
+            c_rec = c_rec.detach()
 
         return dict(
-            t_rec=t_rec.detach(),
+            t_rec=t_rec,
             p_rec_global=p_rec_global,
             p_rec_local=p_rec_local,
             c_rec=c_rec,

@@ -13,7 +13,7 @@ Example:
       --batch_size 1 \
       --num_workers 6 \
       --amp bf16 \
-      --epochs 40 \
+      --epochs 20 \
       --lr 1e-4
 """
 from __future__ import annotations
@@ -84,7 +84,7 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=160)
     p.add_argument("--num_frames", type=int, default=5)
-    p.add_argument("--frame_stride", type=int, default=1)
+    p.add_argument("--frame_stride", type=int, default=4)
 
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=4)
@@ -112,6 +112,16 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--dist_url", default="env://", type=str)
     p.add_argument("--resume", default=None, type=str)
     p.add_argument("--eval_only", action="store_true")
+    p.add_argument(
+        "--freeze_backbone",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Freeze the OccAny backbone. Defaults to false for "
+            "--exp=bevdetocc_lidar and true for other variants; pass "
+            "--freeze_backbone to restore the original BEVDet-OCC LiDAR behavior."
+        ),
+    )
 
     # Which experiment variant to run.
     #   - "light":            existing LightOcc3DUNet head + CE+Lovasz loss.
@@ -575,6 +585,13 @@ def eval_one_epoch(
 
 def main():
     args = get_args_parser().parse_args()
+    if args.freeze_backbone is None:
+        args.freeze_backbone = args.exp != "bevdetocc_lidar"
+    if args.exp != "bevdetocc_lidar" and not args.freeze_backbone:
+        raise ValueError(
+            "--no-freeze_backbone is currently only supported for --exp=bevdetocc_lidar."
+        )
+
     misc.init_distributed_mode_jz(args)
     # xFormers C++ ext is unavailable on this cu126 env; fall back to PyTorch SDPA.
     toggle_memory_efficient_attention(enabled=False)
@@ -620,6 +637,7 @@ def main():
     if args.exp == "bevdetocc_lidar":
         model_kwargs["fusion_attn_type"] = "cross"
         model_kwargs["num_frames"] = args.num_frames
+        model_kwargs["freeze_backbone"] = args.freeze_backbone
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
         model_kwargs["fusion3d_enabled"] = args.fusion3d
@@ -664,17 +682,24 @@ def main():
             f"alpha_init={args.memory_voxel_alpha_init}"
         )
 
-    # Freeze the OccAny backbone in every variant (light / monoscene /
-    # monoscene_lidar). Trainable params:
+    # Freeze the OccAny backbone unless full fine-tuning is requested for the
+    # BEVDet-OCC LiDAR branch. Trainable params in frozen mode:
     #   light:            lifting + occ_head
     #   monoscene:        lifting + occ_head (incl. monoscene adapter)
     #   monoscene_lidar:  lifting + occ_head + fusion
     #                      (+ optional sorted-3D self-attention / post-lift VFE)
-    for p in model.backbone.parameters():
-        p.requires_grad = False
+    if args.freeze_backbone:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
 
-    backbone_hash = _state_dict_hash(model.backbone.state_dict())
-    print(f"Backbone state_dict hash: {backbone_hash}")
+    backbone_hash = (
+        _state_dict_hash(model.backbone.state_dict()) if args.freeze_backbone else None
+    )
+    print(f"[backbone] freeze={args.freeze_backbone}")
+    if backbone_hash is not None:
+        print(f"Backbone state_dict hash: {backbone_hash}")
+    else:
+        print("Backbone state_dict hash: disabled for full fine-tuning")
 
     # Convert BN -> SyncBN before DDP wrap. At per-GPU bs=1 the MonoScene
     # head's BatchNorm3d layers see one-sample stats per forward, which both
@@ -729,7 +754,17 @@ def main():
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         prev_hash = ckpt.get("backbone_hash", None)
-        if prev_hash is not None and prev_hash != backbone_hash:
+        ckpt_args = ckpt.get("args", {})
+        if isinstance(ckpt_args, dict):
+            ckpt_freeze_backbone = bool(ckpt_args.get("freeze_backbone", True))
+        else:
+            ckpt_freeze_backbone = bool(getattr(ckpt_args, "freeze_backbone", True))
+        if (
+            args.freeze_backbone
+            and ckpt_freeze_backbone
+            and prev_hash is not None
+            and prev_hash != backbone_hash
+        ):
             raise RuntimeError(
                 f"Backbone state_dict hash mismatch on resume: "
                 f"checkpoint expected {prev_hash}, current --occany_ckpt gives {backbone_hash}. "
@@ -738,7 +773,7 @@ def main():
         if args.exp == "bevdetocc_lidar" and "model" in ckpt:
             status = model_to_save.load_state_dict(ckpt["model"], strict=False)
             print(
-                "[resume:bevdetocc_lidar] loaded non-backbone model state: "
+                "[resume:bevdetocc_lidar] loaded model state: "
                 f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
             )
         elif args.exp != "bevdetocc_lidar" and "lifting" in ckpt:
@@ -801,8 +836,13 @@ def main():
 
         if misc.is_main_process():
             if args.exp == "bevdetocc_lidar":
+                model_state = (
+                    _state_dict_without_backbone(model_to_save)
+                    if args.freeze_backbone
+                    else model_to_save.state_dict()
+                )
                 ckpt_payload = {
-                    "model": _state_dict_without_backbone(model_to_save),
+                    "model": model_state,
                     "optimizer": optimizer.state_dict(),
                     "scaler": loss_scaler.state_dict(),
                     "epoch": epoch,

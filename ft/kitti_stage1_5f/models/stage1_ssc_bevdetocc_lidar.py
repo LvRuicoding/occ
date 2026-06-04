@@ -526,7 +526,7 @@ class FrameVolumeWarper(nn.Module):
 
 
 class Stage1SSCBEVDetOccLidarModel(nn.Module):
-    """Frozen OccAny + 2D cross-attn fusion + BEVDet-OCC style 3D backend."""
+    """OccAny + 2D cross-attn fusion + BEVDet-OCC style 3D backend."""
 
     def __init__(
         self,
@@ -565,17 +565,20 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         bevdet_neck_channels: int = 32,
         num_frames: int = 5,
         with_cp: bool = False,
+        freeze_backbone: bool = False,
     ) -> None:
         super().__init__()
         del c_lift  # kept for train.py compatibility; this backend does not use Stage1LiftingModule.
         self.num_frames = int(num_frames)
         self.half_grid_size = tuple(int(v) for v in half_grid_size)
+        self.freeze_backbone = bool(freeze_backbone)
 
         self.backbone = OccAnyRecon5FrameBackbone(
             img_size=backbone_img_size,
             embed_dim=token_dim,
             patch_size=patch_size,
             backbone_dtype=backbone_dtype,
+            freeze=self.freeze_backbone,
         )
         if occany_ckpt is not None:
             self.backbone.load_checkpoint(occany_ckpt)
@@ -658,9 +661,14 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             with_cp=with_cp,
         )
 
+    def set_freeze_backbone(self, freeze: bool = True) -> None:
+        self.freeze_backbone = bool(freeze)
+        self.backbone.set_frozen(self.freeze_backbone)
+
     def train(self, mode: bool = True):
         super().train(mode)
-        self.backbone.eval()
+        if self.freeze_backbone:
+            self.backbone.eval()
         return self
 
     @staticmethod
