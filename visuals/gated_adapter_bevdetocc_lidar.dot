@@ -1,0 +1,395 @@
+digraph GatedAdapterBEVDetOccLidar {
+  graph [
+    rankdir=LR,
+    compound=true,
+    bgcolor="white",
+    pad=0.30,
+    nodesep=0.55,
+    ranksep=0.85,
+    splines=ortho,
+    fontname="Helvetica",
+    fontsize=18,
+    labelloc=t,
+    label="BEVDetOcc LiDAR S4: baseline path vs gated_adapter insertion"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#3b4252",
+    penwidth=1.2,
+    fillcolor="#f8fafc",
+    fontname="Helvetica",
+    fontsize=11,
+    margin="0.10,0.08"
+  ];
+
+  edge [
+    color="#334155",
+    arrowsize=0.75,
+    penwidth=1.2,
+    fontname="Helvetica",
+    fontsize=10
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Inputs
+  // ---------------------------------------------------------------------------
+  subgraph cluster_inputs {
+    label="Inputs per sample";
+    color="#cbd5e1";
+    penwidth=1.2;
+    style="rounded,dashed";
+    fillcolor="#ffffff";
+
+    views [
+      label="5 camera frames\nviews[0]=target t\nviews[1..4]=t-4,t-8,t-12,t-16\n(frame_stride=4)",
+      fillcolor="#eff6ff"
+    ];
+    lidar_points [
+      label="LiDAR sweeps\npoints_per_frame\n5 frames",
+      fillcolor="#eff6ff"
+    ];
+    calib [
+      label="Calibration / poses\nK_per_frame\nT_cam_from_velo\ncam2world\nT_target_from_refcam",
+      fillcolor="#eff6ff"
+    ];
+    voxel_gt [
+      label="Voxel GT label\n(B, 256, 256, 32)\n20 classes incl. empty",
+      fillcolor="#fff7ed"
+    ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Frozen OccAny + 2D LiDAR/image fusion
+  // ---------------------------------------------------------------------------
+  subgraph cluster_frontend {
+    label="Shared front-end before the ablation point";
+    color="#cbd5e1";
+    style="rounded";
+
+    backbone [
+      label="Frozen OccAny backbone\nimage encoder / recon tokens\ntrain(): backbone.eval()",
+      fillcolor="#e0f2fe"
+    ];
+    cross_attn [
+      label="2D LiDAR-image cross attention\nLidarImageFusionModule\nQ=image tokens, KV=projected LiDAR memory",
+      fillcolor="#e0f2fe"
+    ];
+    token_projector [
+      label="OccAnyTokenProjector\nproject fused tokens to LSS channels\noutput: feat_2d\n(B, N, 256, H/16, W/16)\nfor 160x512: H/16=10, W/16=32",
+      fillcolor="#e0f2fe"
+    ];
+  }
+
+  views -> backbone;
+  lidar_points -> cross_attn;
+  calib -> cross_attn;
+  backbone -> cross_attn [label="t_rec, p_rec_local, c_rec"];
+  cross_attn -> token_projector [label="t_rec_fused"];
+
+  // ---------------------------------------------------------------------------
+  // Baseline bypass
+  // ---------------------------------------------------------------------------
+  baseline_bypass [
+    label="Original baseline path\nNO shared_geometry_adapter\nfeat_2d goes directly into LSSDepthLift",
+    shape=note,
+    fillcolor="#f1f5f9",
+    color="#64748b"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Gated adapter internals
+  // ---------------------------------------------------------------------------
+  subgraph cluster_adapter {
+    label="gated_adapter: inserted between token_projector and LSSDepthLift";
+    color="#f97316";
+    penwidth=2.0;
+    style="rounded";
+    fillcolor="#fff7ed";
+
+    adapter_in [
+      label="Adapter input\nfeat_2d\n(B,N,256,10,32)\nreshape -> (B*N,256,10,32)",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+
+    input_proj [
+      label="input_proj\n1x1 Conv 256->geometry_channels\nBatchNorm2d + GELU",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+    level1 [
+      label="level1\nGeometryResidualConvUnit\nsame resolution: 10x32",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+    level2 [
+      label="level2\n3x3 Conv stride=2 + BN + GELU\nGeometryResidualConvUnit\napprox 5x16",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+    level3 [
+      label="level3\n3x3 Conv stride=2 + BN + GELU\nGeometryResidualConvUnit\napprox 3x8",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+    level4 [
+      label="level4\n3x3 Conv stride=2 + BN + GELU\nGeometryResidualConvUnit\napprox 2x4",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+
+    refine4 [
+      label="refine4\nFeatureFusionBlock\nupsample to level3 size",
+      fillcolor="#fed7aa",
+      color="#ea580c"
+    ];
+    refine3 [
+      label="refine3\nadd skip level3\nupsample to level2 size",
+      fillcolor="#fed7aa",
+      color="#ea580c"
+    ];
+    refine2 [
+      label="refine2\nadd skip level2\nupsample to level1 size",
+      fillcolor="#fed7aa",
+      color="#ea580c"
+    ];
+    refine1 [
+      label="refine1\nadd skip level1\nsame final spatial size",
+      fillcolor="#fed7aa",
+      color="#ea580c"
+    ];
+    shared_out [
+      label="shared_out\nGeometryResidualConvUnit\noutput: shared_geometry_feat\n(B,N,geometry_channels,10,32)",
+      fillcolor="#fed7aa",
+      color="#ea580c"
+    ];
+    occ_guidance [
+      label="occ_guidance\nGeometryResidualConvUnit\n1x1 Conv geometry_channels->256\nBN + GELU\noutput: delta",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+    gate [
+      label="learnable residual gate alpha\n--geometry_adapter_gate_init 0.0\nalpha starts at 0",
+      shape=diamond,
+      fillcolor="#fef3c7",
+      color="#d97706"
+    ];
+    residual_add [
+      label="gated residual merge\nfeat_2d_refined = feat_2d + alpha * delta\ninitially almost identical to baseline",
+      shape=box,
+      fillcolor="#fde68a",
+      color="#d97706",
+      penwidth=2.0
+    ];
+    adapter_out [
+      label="Adapter output to LSS\nfeat_2d_refined\n(B,N,256,10,32)",
+      fillcolor="#ffedd5",
+      color="#ea580c"
+    ];
+
+    adapter_in -> input_proj -> level1 -> level2 -> level3 -> level4;
+    level4 -> refine4;
+    refine4 -> refine3;
+    level3 -> refine3 [style=dashed, label="skip"];
+    refine3 -> refine2;
+    level2 -> refine2 [style=dashed, label="skip"];
+    refine2 -> refine1;
+    level1 -> refine1 [style=dashed, label="skip"];
+    refine1 -> shared_out -> occ_guidance -> residual_add;
+    gate -> residual_add [label="alpha"];
+    adapter_in -> residual_add [style=dashed, color="#d97706", label="identity residual"];
+    residual_add -> adapter_out;
+  }
+
+  token_projector -> baseline_bypass [style=dashed, color="#64748b", label="baseline only"];
+  token_projector -> adapter_in [
+    color="#f97316",
+    penwidth=2.2,
+    label="gated_adapter enabled"
+  ];
+
+  // In this ablation, the dense depth head exists when the adapter is enabled,
+  // but it is not used unless return_dense_depth / dense_depth_supervision is on.
+  dense_depth_head [
+    label="DenseDepthHead side branch\nfrom shared_geometry_feat[:,0]\ncontinuous image-scale depth\nINACTIVE in gated_adapter-only ablation\n(--no-dense_depth_supervision)",
+    shape=component,
+    style="rounded,dashed,filled",
+    fillcolor="#f8fafc",
+    color="#94a3b8"
+  ];
+  shared_out -> dense_depth_head [
+    style=dashed,
+    color="#94a3b8",
+    label="constructed with adapter,\nnot returned / no loss"
+  ];
+
+  // ---------------------------------------------------------------------------
+  // LSS and 3D backend
+  // ---------------------------------------------------------------------------
+  subgraph cluster_lss {
+    label="LSSDepthLift and BEVDetOcc LiDAR 3D backend";
+    color="#38bdf8";
+    penwidth=1.6;
+    style="rounded";
+
+    lss_depth_net [
+      label="LSSDepthLift.depth_net\n3x3 Conv + BN + ReLU + 1x1 Conv\nsplits into depth_logits and img_feat",
+      fillcolor="#ecfeff",
+      color="#0891b2"
+    ];
+    depth_logits [
+      label="depth_logits\n(B,N,D,10,32)\nD = arange(1.0,52.0,0.4)",
+      fillcolor="#ecfeff",
+      color="#0891b2"
+    ];
+    img_feat [
+      label="img_feat\n(B,N,32,10,32)",
+      fillcolor="#ecfeff",
+      color="#0891b2"
+    ];
+    depth_prob [
+      label="softmax(depth_logits)\ndepth probability per pixel bin",
+      fillcolor="#cffafe",
+      color="#0891b2"
+    ];
+    frustum [
+      label="Frustum -> voxel scatter\nuses K, T_cam_from_velo, image_hw\nhalf grid: 128 x 128 x 16\nvoxel size: 0.4m",
+      fillcolor="#cffafe",
+      color="#0891b2"
+    ];
+    lss_volume [
+      label="Per-frame LSS volume\n(B,N,32,128,128,16)",
+      fillcolor="#cffafe",
+      color="#0891b2"
+    ];
+    lidar_memory [
+      label="PerFrameLidarMemory\nvoxelize raw LiDAR into memory volume\n(B,N,32,128,128,16)",
+      fillcolor="#dcfce7",
+      color="#16a34a"
+    ];
+    natten [
+      label="PerFrameNattenFusion\n3D neighborhood cross attention\nQ=LSS, KV=LiDAR memory",
+      fillcolor="#dcfce7",
+      color="#16a34a"
+    ];
+    concat [
+      label="concat(enhanced_lss, memory)\nper-frame channels: 32 + 32 = 64",
+      fillcolor="#dcfce7",
+      color="#16a34a"
+    ];
+    warper [
+      label="FrameVolumeWarper\nwarp 5 frame volumes to target velo grid\nusing cam2world and T_target_from_refcam",
+      fillcolor="#e0f2fe",
+      color="#0284c7"
+    ];
+    temporal_reduce [
+      label="temporal_reduce\n3D Conv-BN-ReLU\n5*64 channels -> 64 channels",
+      fillcolor="#e0f2fe",
+      color="#0284c7"
+    ];
+    occ_head [
+      label="BEVDetOcc3DHead\nCustomResNet3D + LSSFPN3D style neck\noutput semantic occupancy logits",
+      fillcolor="#ede9fe",
+      color="#7c3aed"
+    ];
+    ssc_logits [
+      label="ssc_logit\n(B,20,256,256,32)\nargmax -> SSC prediction",
+      fillcolor="#ede9fe",
+      color="#7c3aed"
+    ];
+
+    lss_depth_net -> depth_logits;
+    lss_depth_net -> img_feat;
+    depth_logits -> depth_prob;
+    depth_prob -> frustum;
+    img_feat -> frustum;
+    frustum -> lss_volume;
+    lidar_memory -> natten [label="KV"];
+    lss_volume -> natten [label="Q"];
+    natten -> concat [label="enhanced_lss"];
+    lidar_memory -> concat [label="memory"];
+    concat -> warper -> temporal_reduce -> occ_head -> ssc_logits;
+  }
+
+  baseline_bypass -> lss_depth_net [
+    lhead=cluster_lss,
+    style=dashed,
+    color="#64748b",
+    label="baseline input"
+  ];
+  adapter_out -> lss_depth_net [
+    lhead=cluster_lss,
+    color="#f97316",
+    penwidth=2.2,
+    label="modified input"
+  ];
+  calib -> frustum [style=dashed, label="projection"];
+  calib -> warper [style=dashed, label="poses"];
+  lidar_points -> lidar_memory [label="raw points"];
+
+  // ---------------------------------------------------------------------------
+  // Losses and ablation switches
+  // ---------------------------------------------------------------------------
+  subgraph cluster_losses {
+    label="Training losses / switches";
+    color="#cbd5e1";
+    style="rounded,dashed";
+
+    ssc_loss [
+      label="SSC semantic loss\nCE + Lovasz\nalways used",
+      fillcolor="#fff1f2",
+      color="#e11d48"
+    ];
+    sparse_depth_loss [
+      label="Sparse BEVDet depth loss\nfrom LiDAR projected depth targets\nactive only if --depth_supervision\nNOTE: ablation script leaves this ON",
+      fillcolor="#fff7ed",
+      color="#f97316"
+    ];
+    dense_lss_loss [
+      label="Dense LSS depth loss\n--dense_lss_depth_supervision\nOFF for gated_adapter-only",
+      style="rounded,dashed,filled",
+      fillcolor="#f8fafc",
+      color="#94a3b8"
+    ];
+    dense_depth_loss_node [
+      label="Dense continuous depth loss\n--dense_depth_supervision\nOFF for gated_adapter-only",
+      style="rounded,dashed,filled",
+      fillcolor="#f8fafc",
+      color="#94a3b8"
+    ];
+  }
+
+  ssc_logits -> ssc_loss [label="supervise semantic occupancy"];
+  voxel_gt -> ssc_loss;
+  depth_logits -> sparse_depth_loss [style=dashed, label="if enabled"];
+  lidar_points -> sparse_depth_loss [style=dashed, label="build_depth_target"];
+  depth_logits -> dense_lss_loss [style=dashed, color="#94a3b8"];
+  dense_depth_head -> dense_depth_loss_node [style=dashed, color="#94a3b8"];
+
+  // ---------------------------------------------------------------------------
+  // Legend
+  // ---------------------------------------------------------------------------
+  subgraph cluster_legend {
+    label="Legend";
+    color="#e2e8f0";
+    style="rounded";
+
+    legend1 [
+      label="Orange solid path = new gated_adapter architecture",
+      fillcolor="#ffedd5",
+      color="#f97316"
+    ];
+    legend2 [
+      label="Gray dashed path = original baseline bypass / inactive branch",
+      fillcolor="#f8fafc",
+      color="#94a3b8"
+    ];
+    legend3 [
+      label="Key modification: only LSS input feature is changed\nrest of LiDAR memory, warping, temporal reduce, and BEVDetOcc head stay the same",
+      fillcolor="#f1f5f9",
+      color="#64748b"
+    ];
+  }
+}

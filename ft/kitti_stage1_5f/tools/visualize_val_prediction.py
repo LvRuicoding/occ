@@ -113,6 +113,9 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num_frames", default=None, type=int)
     p.add_argument("--frame_stride", default=None, type=int)
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default=None)
+    p.add_argument("--shared_geometry_adapter", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--geometry_channels", type=int, default=None)
+    p.add_argument("--geometry_adapter_gate_init", type=float, default=None)
     p.add_argument("--fusion3d", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--fusion3d_seq_len", type=int, default=None)
     p.add_argument("--fusion3d_num_heads", type=int, default=None)
@@ -525,6 +528,14 @@ def build_model(
     if exp == "bevdetocc_lidar":
         model_kwargs["fusion_attn_type"] = "cross"
         model_kwargs["num_frames"] = int(ckpt_arg(ckpt_args, "num_frames", 5))
+        shared_geometry_enabled = ckpt_arg(ckpt_args, "shared_geometry_adapter", None)
+        if shared_geometry_enabled is None:
+            shared_geometry_enabled = bool(ckpt_arg(ckpt_args, "dense_depth_supervision", False))
+        model_kwargs["use_shared_geometry_adapter"] = bool(shared_geometry_enabled)
+        model_kwargs["geometry_channels"] = int(ckpt_arg(ckpt_args, "geometry_channels", 256))
+        model_kwargs["geometry_adapter_gate_init"] = float(
+            ckpt_arg(ckpt_args, "geometry_adapter_gate_init", 0.0)
+        )
     if exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = ckpt_arg(ckpt_args, "fusion_attn_type", "self")
         model_kwargs["fusion3d_enabled"] = bool(ckpt_arg(ckpt_args, "fusion3d", False))
@@ -573,9 +584,14 @@ def build_model(
         if "model" not in ckpt:
             raise KeyError("bevdetocc_lidar checkpoint must contain a 'model' state_dict.")
         status = model.load_state_dict(ckpt["model"], strict=False)
+        missing_non_backbone = [
+            key for key in status.missing_keys if not str(key).startswith("backbone.")
+        ]
         print(
             "[visualize:bevdetocc_lidar] loaded non-backbone model state: "
-            f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
+            f"missing_total={len(status.missing_keys)} "
+            f"missing_non_backbone={len(missing_non_backbone)} "
+            f"unexpected={len(status.unexpected_keys)}"
         )
         model.eval()
         return model
@@ -679,6 +695,9 @@ def main() -> None:
     ckpt_args["exp"] = exp
     for name in (
         "fusion_attn_type",
+        "shared_geometry_adapter",
+        "geometry_channels",
+        "geometry_adapter_gate_init",
         "fusion3d",
         "fusion3d_seq_len",
         "fusion3d_num_heads",

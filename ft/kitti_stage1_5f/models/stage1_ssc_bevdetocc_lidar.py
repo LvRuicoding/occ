@@ -108,6 +108,7 @@ class SharedGeometryAdapter(nn.Module):
         in_channels: int = 256,
         geometry_channels: int = 256,
         out_channels: int = 256,
+        residual_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         in_channels = int(in_channels)
@@ -180,6 +181,9 @@ class SharedGeometryAdapter(nn.Module):
             nn.GELU(),
         )
         self.use_input_residual = in_channels == out_channels
+        self.residual_gate = nn.Parameter(
+            torch.tensor(float(residual_gate_init), dtype=torch.float32)
+        )
 
     def forward(self, feat_2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if feat_2d.ndim != 5:
@@ -199,9 +203,12 @@ class SharedGeometryAdapter(nn.Module):
         y = self.refine2(y, l2, size=l1.shape[-2:])
         shared = self.shared_out(self.refine1(y, l1))
 
-        refined = self.occ_guidance(shared)
+        delta = self.occ_guidance(shared)
         if self.use_input_residual:
-            refined = refined + x
+            gate = self.residual_gate.to(device=delta.device, dtype=delta.dtype)
+            refined = x + gate * delta
+        else:
+            refined = delta
 
         C_refined = refined.shape[1]
         C_shared = shared.shape[1]
@@ -572,6 +579,100 @@ def bevdet_depth_loss(
     return weighted_loss, raw_loss.detach(), valid_count.to(dtype=torch.float32)
 
 
+def dense_lss_depth_loss(
+    depth_logits: torch.Tensor,
+    dense_depth_gt: torch.Tensor,
+    has_dense_depth: Optional[torch.Tensor] = None,
+    depth_start: float = 1.0,
+    depth_step: float = 0.4,
+    min_depth: float = 1.0,
+    max_depth: float = 80.0,
+    loss_weight: float = 0.05,
+    target_index: int = 0,
+    min_valid_ratio: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Masked target-frame dense-depth CE over the LSS depth distribution."""
+    if depth_logits.ndim != 5:
+        raise RuntimeError(
+            f"depth_logits must be (B, N, D, H, W), got {tuple(depth_logits.shape)}."
+        )
+    B, N, D, H_t, W_t = depth_logits.shape
+    target_index = int(target_index)
+    if target_index < 0 or target_index >= N:
+        raise RuntimeError(f"target_index={target_index} is out of range for N={N}.")
+
+    gt = dense_depth_gt
+    if gt.ndim == 5:
+        gt = gt[:, target_index, 0]
+    elif gt.ndim == 4:
+        if gt.shape[1] == 1:
+            gt = gt[:, 0]
+        else:
+            gt = gt[:, target_index]
+    elif gt.ndim != 3:
+        raise RuntimeError(
+            "dense_depth_gt must be (B,H,W), (B,N,H,W), or (B,N,1,H,W), got "
+            f"{tuple(gt.shape)}."
+        )
+    if gt.shape[0] != B:
+        raise RuntimeError(
+            f"dense_depth_gt batch {gt.shape[0]} does not match depth_logits batch {B}."
+        )
+
+    device_type = depth_logits.device.type
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        logits = depth_logits[:, target_index].float()
+        gt_f = gt.to(device=logits.device, dtype=torch.float32)
+        valid_src = (
+            torch.isfinite(gt_f)
+            & (gt_f >= float(min_depth))
+            & (gt_f <= float(max_depth))
+        )
+        if has_dense_depth is not None:
+            has = has_dense_depth.to(device=logits.device, dtype=torch.bool)
+            if has.ndim == 2:
+                has = has[:, target_index]
+            elif has.ndim != 1:
+                raise RuntimeError(
+                    "has_dense_depth must be (B,) or (B,N), got "
+                    f"{tuple(has_dense_depth.shape)}."
+                )
+            valid_src = valid_src & has.view(B, 1, 1)
+
+        if gt_f.shape[-2:] == (H_t, W_t):
+            gt_down = gt_f
+            valid = valid_src
+        else:
+            valid_f = valid_src.float()
+            gt_clean = torch.where(valid_src, gt_f, torch.zeros_like(gt_f))
+            depth_sum = F.interpolate(
+                (gt_clean * valid_f).unsqueeze(1),
+                size=(H_t, W_t),
+                mode="area",
+            )[:, 0]
+            valid_ratio = F.interpolate(
+                valid_f.unsqueeze(1),
+                size=(H_t, W_t),
+                mode="area",
+            )[:, 0]
+            gt_down = depth_sum / valid_ratio.clamp(min=1e-6)
+            valid = valid_ratio > float(min_valid_ratio)
+
+        depth_labels = (gt_down - (float(depth_start) - float(depth_step))) / float(depth_step)
+        valid = valid & (depth_labels >= 1.0) & (depth_labels < float(D + 1))
+        valid_count = valid.sum()
+        if not bool(valid_count.item()):
+            zero = logits.sum() * 0.0
+            return zero, zero.detach(), valid_count.to(dtype=torch.float32)
+
+        label_ids = depth_labels.long().clamp(min=1, max=D) - 1
+        logits_flat = logits.permute(0, 2, 3, 1).contiguous()[valid]
+        labels_flat = label_ids[valid]
+        raw_loss = F.cross_entropy(logits_flat, labels_flat, reduction="mean")
+        weighted_loss = float(loss_weight) * raw_loss
+    return weighted_loss, raw_loss.detach(), valid_count.to(dtype=torch.float32)
+
+
 def dense_depth_loss(
     pred_depth: torch.Tensor,
     gt_depth: torch.Tensor,
@@ -863,6 +964,7 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         lss_out_channels: int = 32,
         use_shared_geometry_adapter: bool = False,
         geometry_channels: int = 256,
+        geometry_adapter_gate_init: float = 0.0,
         lidar_d_voxel: int = 128,
         lidar_hidden: int = 64,
         lidar_pe_num_freqs: int = 8,
@@ -922,6 +1024,7 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
                 in_channels=lss_in_channels,
                 geometry_channels=geometry_channels,
                 out_channels=lss_in_channels,
+                residual_gate_init=geometry_adapter_gate_init,
             )
             self.dense_depth_head = DenseDepthHead(in_channels=geometry_channels)
         else:
@@ -1009,6 +1112,7 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         image_hw: torch.Tensor,
         gt_depth: Optional[torch.Tensor] = None,
         return_depth: bool = False,
+        return_lss_depth: bool = False,
         dense_depth_gt: Optional[torch.Tensor] = None,
         has_dense_depth: Optional[torch.Tensor] = None,
         return_dense_depth: bool = False,
@@ -1073,14 +1177,20 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             if pred_dense_depth is None:
                 raise RuntimeError("dense depth prediction was not computed.")
             out["pred_dense_depth"] = pred_dense_depth
-            if dense_depth_gt is not None:
-                out["dense_depth_gt"] = dense_depth_gt.to(
-                    device=pred_dense_depth.device, dtype=torch.float32
-                )
-            if has_dense_depth is not None:
-                out["has_dense_depth"] = has_dense_depth.to(
-                    device=pred_dense_depth.device, dtype=torch.bool
-                )
+        if dense_depth_gt is not None:
+            out["dense_depth_gt"] = dense_depth_gt.to(
+                device=depth_logits.device, dtype=torch.float32
+            )
+        if has_dense_depth is not None:
+            out["has_dense_depth"] = has_dense_depth.to(
+                device=depth_logits.device, dtype=torch.bool
+            )
+        if return_depth or return_lss_depth:
+            out.update(
+                depth_logits=depth_logits,
+                depth_start=self.lss.depth_start,
+                depth_step=self.lss.depth_step,
+            )
         if return_depth:
             if gt_depth is None:
                 gt_depth = self.lss.build_depth_target(
@@ -1093,10 +1203,7 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
                     device=depth_logits.device,
                 )
             out.update(
-                depth_logits=depth_logits,
                 gt_depth=gt_depth.to(device=depth_logits.device, dtype=torch.float32),
-                depth_start=self.lss.depth_start,
-                depth_step=self.lss.depth_step,
             )
         return out
 
@@ -1104,5 +1211,6 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
 __all__ = [
     "Stage1SSCBEVDetOccLidarModel",
     "bevdet_depth_loss",
+    "dense_lss_depth_loss",
     "dense_depth_loss",
 ]
