@@ -18,6 +18,11 @@ from .stage1_ssc_bevdetocc_lidar_dense_depth import (
     Stage1SSCBEVDetOccLidarDenseDepthModel,
     dense_metric_depth_loss,
 )
+from .stage1_ssc_bevdetocc_lidar_pointmap import (
+    PostFusionPointmapHead,
+    Stage1SSCBEVDetOccLidarPointmapModel,
+    pointmap_reconstruction_loss,
+)
 
 __all__ = [
     "OccAnyRecon5FrameBackbone",
@@ -30,8 +35,11 @@ __all__ = [
     "Stage1SSCMonoLidarModel",
     "Stage1SSCBEVDetOccLidarModel",
     "Stage1SSCBEVDetOccLidarDenseDepthModel",
+    "Stage1SSCBEVDetOccLidarPointmapModel",
     "SingleScaleDPTDepthHead",
+    "PostFusionPointmapHead",
     "dense_metric_depth_loss",
+    "pointmap_reconstruction_loss",
     "LidarImageFusionModule",
     "Sorted3DTokenFusionLayer",
     "VoxelFeatureEncoder",

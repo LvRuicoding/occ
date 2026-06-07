@@ -63,15 +63,25 @@ from ..losses_monoscene import MonoSceneSSCLoss
 from ..models import (
     Stage1SSCBEVDetOccLidarDenseDepthModel,
     Stage1SSCBEVDetOccLidarModel,
+    Stage1SSCBEVDetOccLidarPointmapModel,
     Stage1SSCModel,
     Stage1SSCMonoModel,
     Stage1SSCMonoLidarModel,
+    pointmap_reconstruction_loss,
 )
 from ..models.stage1_ssc_bevdetocc_lidar_dense_depth import dense_metric_depth_loss
 from ..models.stage1_ssc_bevdetocc_lidar import bevdet_depth_loss
 
 
-BEVDETOCC_LIDAR_EXPS = ("bevdetocc_lidar", "bevdetocc_lidar_dense_depth")
+BEVDETOCC_LIDAR_EXPS = (
+    "bevdetocc_lidar",
+    "bevdetocc_lidar_dense_depth",
+    "bevdetocc_lidar_pointmap",
+)
+BEVDETOCC_DENSE_DEPTH_DATA_EXPS = (
+    "bevdetocc_lidar_dense_depth",
+    "bevdetocc_lidar_pointmap",
+)
 LIDAR_EXPS = ("monoscene_lidar", *BEVDETOCC_LIDAR_EXPS)
 MONOSCENE_LOSS_EXPS = ("monoscene", "monoscene_lidar")
 
@@ -153,6 +163,8 @@ def get_args_parser() -> argparse.ArgumentParser:
     #                         3D encoder/head. Requires --velodyne_root.
     #   - "bevdetocc_lidar_dense_depth": same as bevdetocc_lidar plus a
     #                         post-2D-fusion DPT-style dense depth head.
+    #   - "bevdetocc_lidar_pointmap": same as bevdetocc_lidar plus a cloned
+    #                         OccAny pointmap head after the 2D LiDAR fusion.
     p.add_argument(
         "--exp",
         choices=[
@@ -161,6 +173,7 @@ def get_args_parser() -> argparse.ArgumentParser:
             "monoscene_lidar",
             "bevdetocc_lidar",
             "bevdetocc_lidar_dense_depth",
+            "bevdetocc_lidar_pointmap",
         ],
         default="light",
     )
@@ -180,6 +193,12 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="Weight for dense metric depth auxiliary loss.")
     p.add_argument("--dense_depth_features", type=int, default=128,
                    help="Feature width for the single-scale DPT-style dense depth head.")
+    p.add_argument("--pointmap_supervision", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable post-2D-fusion pointmap supervision for --exp=bevdetocc_lidar_pointmap.")
+    p.add_argument("--pointmap_loss_weight", type=float, default=0.1,
+                   help="Weight for OccAny-style pointmap auxiliary loss.")
+    p.add_argument("--pointmap_conf_alpha", type=float, default=0.2,
+                   help="Confidence regularization alpha for OccAny-style pointmap loss.")
     p.add_argument("--fusion_attn_type", choices=["self", "cross"], default="self",
                    help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
                         "'self' uses image+voxel window self-attention; 'cross' "
@@ -237,9 +256,9 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
         output_resolution=(args.width, args.height),
         cam_idx=0,
     )
-    if args.exp == "bevdetocc_lidar_dense_depth":
+    if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
         if not args.velodyne_root:
-            raise ValueError("--velodyne_root is required when --exp=bevdetocc_lidar_dense_depth")
+            raise ValueError(f"--velodyne_root is required when --exp={args.exp}")
         return Kitti5FrameStage1LidarDenseDepthDataset(
             velodyne_root=args.velodyne_root,
             max_points_per_sweep=args.max_points_per_sweep,
@@ -267,7 +286,7 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
 
 
 def _collate_fn(args):
-    if args.exp == "bevdetocc_lidar_dense_depth":
+    if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
         return collate_stage1_lidar_dense_depth
     if args.exp == "bevdetocc_lidar":
         return collate_stage1_lidar
@@ -455,6 +474,63 @@ def _maybe_add_dense_depth_loss(
     return loss + dense_weighted, details
 
 
+def _stack_cam2world_from_views(batch: Dict, device: torch.device) -> torch.Tensor:
+    return torch.stack(
+        [
+            v["cam2world"].to(device=device, dtype=torch.float32, non_blocking=True)
+            for v in batch["views"]
+        ],
+        dim=1,
+    )
+
+
+def _maybe_add_pointmap_loss(
+    loss: torch.Tensor,
+    details: Dict[str, float],
+    out: Dict,
+    batch: Dict,
+    args,
+    *,
+    is_train: bool,
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    if args.exp != "bevdetocc_lidar_pointmap" or not bool(
+        getattr(args, "pointmap_supervision", False)
+    ):
+        return loss, details
+    required = ("pointmap_pts3d", "pointmap_pts3d_local", "pointmap_conf")
+    missing = [k for k in required if k not in out]
+    if missing:
+        raise RuntimeError(f"Pointmap supervision expected model output keys {missing}.")
+    if "dense_depth" not in batch:
+        raise RuntimeError(
+            "Pointmap supervision requires batch['dense_depth']; use the dense-depth "
+            "LiDAR dataset/collate path."
+        )
+
+    device = out["pointmap_pts3d"].device
+    frame_mask = batch.get("dense_depth_frame_mask")
+    if frame_mask is not None:
+        frame_mask = frame_mask.to(device=device, non_blocking=True)
+    pointmap_weighted, _pointmap_raw, pointmap_details = pointmap_reconstruction_loss(
+        pred_pts3d=out["pointmap_pts3d"],
+        pred_pts3d_local=out["pointmap_pts3d_local"],
+        pred_conf=out["pointmap_conf"],
+        dense_depth=batch["dense_depth"].to(device=device, non_blocking=True),
+        K_per_frame=batch["K_per_frame"].to(device=device, non_blocking=True),
+        cam2world_per_frame=_stack_cam2world_from_views(batch, device),
+        frame_mask=frame_mask,
+        loss_weight=float(args.pointmap_loss_weight),
+        conf_alpha=float(args.pointmap_conf_alpha),
+        gt_scale=not is_train,
+    )
+    prefix = "pointmap_train" if is_train else "pointmap_eval"
+    details = dict(details)
+    for key, value in pointmap_details.items():
+        suffix = "loss" if key == "pointmap" else key.removeprefix("pointmap_")
+        details[f"{prefix}_{suffix}"] = value
+    return loss + pointmap_weighted, details
+
+
 def _sanitize_metric_key(name: str) -> str:
     return str(name).replace(" ", "_").replace("-", "_").replace("/", "_")
 
@@ -546,6 +622,9 @@ def train_one_epoch(
                 loss, details = criterion(out["ssc_logit"], target)
                 loss, details = _maybe_add_bevdet_depth_loss(loss, details, out, args)
                 loss, details = _maybe_add_dense_depth_loss(loss, details, out, batch, args)
+                loss, details = _maybe_add_pointmap_loss(
+                    loss, details, out, batch, args, is_train=True
+                )
             else:
                 loss, details = criterion(out, target)
         loss_value = float(loss.detach())
@@ -619,6 +698,9 @@ def eval_one_epoch(
                 loss, _details = criterion(out["ssc_logit"], target)
                 loss, _details = _maybe_add_bevdet_depth_loss(loss, _details, out, args)
                 loss, _details = _maybe_add_dense_depth_loss(loss, _details, out, batch, args)
+                loss, _details = _maybe_add_pointmap_loss(
+                    loss, _details, out, batch, args, is_train=False
+                )
                 logits = out["ssc_logit"]
             else:
                 loss, _details = criterion(out, target)
@@ -716,7 +798,9 @@ def main():
     else:
         backbone_dtype = torch.float32
 
-    if args.exp == "bevdetocc_lidar_dense_depth":
+    if args.exp == "bevdetocc_lidar_pointmap":
+        model_cls = Stage1SSCBEVDetOccLidarPointmapModel
+    elif args.exp == "bevdetocc_lidar_dense_depth":
         model_cls = Stage1SSCBEVDetOccLidarDenseDepthModel
     elif args.exp == "bevdetocc_lidar":
         model_cls = Stage1SSCBEVDetOccLidarModel
@@ -772,6 +856,12 @@ def main():
                 f"[dense_depth] enabled={args.dense_depth_supervision} "
                 f"weight={args.dense_depth_loss_weight} "
                 f"features={args.dense_depth_features}"
+            )
+        if args.exp == "bevdetocc_lidar_pointmap":
+            print(
+                f"[pointmap] enabled={args.pointmap_supervision} "
+                f"weight={args.pointmap_loss_weight} "
+                f"conf_alpha={args.pointmap_conf_alpha}"
             )
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")
