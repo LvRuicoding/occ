@@ -11,11 +11,12 @@ from PIL import Image
 
 from occany.utils.helpers import crop_resize_if_necessary
 
+from .kitti_stage1 import Kitti5FrameStage1Dataset, collate_stage1
 from .kitti_stage1_mono_lidar import Kitti5FrameStage1LidarDataset, collate_stage1_lidar
 
 
-class Kitti5FrameStage1LidarDenseDepthDataset(Kitti5FrameStage1LidarDataset):
-    """``Kitti5FrameStage1LidarDataset`` plus optional dense depth supervision.
+class _DenseDepthMixin:
+    """Mixin adding per-frame dense depth maps from processed frame npz files.
 
     Each processed frame ``*.npz`` may contain ``dense_depthmap`` in metric
     depth units (meters). Frames without that key, or with no valid positive
@@ -69,6 +70,27 @@ class Kitti5FrameStage1LidarDenseDepthDataset(Kitti5FrameStage1LidarDataset):
         return data
 
 
+class Kitti5FrameStage1DenseDepthDataset(_DenseDepthMixin, Kitti5FrameStage1Dataset):
+    """Stage-1 sample plus optional dense depth, without raw LiDAR sweeps."""
+
+
+class Kitti5FrameStage1LidarDenseDepthDataset(
+    _DenseDepthMixin,
+    Kitti5FrameStage1LidarDataset,
+):
+    """Stage-1 LiDAR sample plus optional dense depth supervision."""
+
+
+def collate_stage1_dense_depth(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate Stage-1 samples with optional dense depth supervision."""
+    out = collate_stage1(batch)
+    out["dense_depth"] = torch.stack([b["dense_depth"] for b in batch], dim=0)
+    out["dense_depth_frame_mask"] = torch.stack(
+        [b["dense_depth_frame_mask"] for b in batch], dim=0
+    )
+    return out
+
+
 def collate_stage1_lidar_dense_depth(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Collate Stage-1 LiDAR samples with optional dense depth supervision."""
     out = collate_stage1_lidar(batch)
@@ -80,6 +102,8 @@ def collate_stage1_lidar_dense_depth(batch: List[Dict[str, Any]]) -> Dict[str, A
 
 
 __all__ = [
+    "Kitti5FrameStage1DenseDepthDataset",
     "Kitti5FrameStage1LidarDenseDepthDataset",
+    "collate_stage1_dense_depth",
     "collate_stage1_lidar_dense_depth",
 ]

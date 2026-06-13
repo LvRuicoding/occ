@@ -39,8 +39,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc
+from dust3r.losses import L21
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 
+from occany.loss.losses_multiview import ConfLoss_multiview, Regr3D_multiview
 from occany.metrics.ssc import SSCMetrics
 from occany.model.must3r_blocks.attention import toggle_memory_efficient_attention
 from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
@@ -48,12 +50,14 @@ from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
 from ft.semantickitti_ft.losses import SSCLoss
 from ..datasets import (
     KITTI_SSC_CLASS_NAMES,
+    Kitti5FrameStage1DenseDepthDataset,
     Kitti5FrameStage1Dataset,
     Kitti5FrameStage1LidarDenseDepthDataset,
     Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoDataset,
     Kitti5FrameStage1MonoLidarDataset,
     collate_stage1,
+    collate_stage1_dense_depth,
     collate_stage1_lidar_dense_depth,
     collate_stage1_lidar,
     collate_stage1_mono,
@@ -64,25 +68,48 @@ from ..models import (
     Stage1SSCBEVDetOccLidarDenseDepthModel,
     Stage1SSCBEVDetOccLidarModel,
     Stage1SSCBEVDetOccLidarPointmapModel,
+    Stage1PointmapOriginalModel,
+    Stage1PointmapPostFusionOnlyModel,
+    Stage1SSCBEVDetOccLidarPointmapDenseDepthModel,
     Stage1SSCModel,
     Stage1SSCMonoModel,
     Stage1SSCMonoLidarModel,
-    pointmap_reconstruction_loss,
 )
 from ..models.stage1_ssc_bevdetocc_lidar_dense_depth import dense_metric_depth_loss
 from ..models.stage1_ssc_bevdetocc_lidar import bevdet_depth_loss
+from ..models.stage1_ssc_bevdetocc_lidar_pointmap import _pointmap_targets_from_depth
+from ..pointmap_metrics import (
+    PointmapMetricAccumulator,
+    add_pointmap_metric_args,
+    update_pointmap_metrics_from_batch,
+)
 
 
 BEVDETOCC_LIDAR_EXPS = (
     "bevdetocc_lidar",
     "bevdetocc_lidar_dense_depth",
     "bevdetocc_lidar_pointmap",
+    "bevdetocc_lidar_pointmap_dense_depth",
+)
+POINTMAP_ONLY_EXPS = (
+    "pointmap_postfusion_only",
+    "pointmap_original",
+)
+POINTMAP_QUALITY_EXPS = (
+    *POINTMAP_ONLY_EXPS,
+    "bevdetocc_lidar_pointmap",
+    "bevdetocc_lidar_pointmap_dense_depth",
 )
 BEVDETOCC_DENSE_DEPTH_DATA_EXPS = (
     "bevdetocc_lidar_dense_depth",
     "bevdetocc_lidar_pointmap",
+    "bevdetocc_lidar_pointmap_dense_depth",
+    "pointmap_postfusion_only",
 )
-LIDAR_EXPS = ("monoscene_lidar", *BEVDETOCC_LIDAR_EXPS)
+POINTMAP_DENSE_DEPTH_DATA_EXPS = (
+    "pointmap_original",
+)
+LIDAR_EXPS = ("monoscene_lidar", *BEVDETOCC_LIDAR_EXPS, "pointmap_postfusion_only")
 MONOSCENE_LOSS_EXPS = ("monoscene", "monoscene_lidar")
 
 
@@ -130,21 +157,21 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--freeze_backbone",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=True,
         help=(
-            "Freeze the OccAny backbone. Defaults to false for BEVDet-OCC "
-            "LiDAR variants and true for other variants; pass "
-            "--freeze_backbone to restore the original BEVDet-OCC LiDAR behavior."
+            "Freeze the OccAny reconstruction encoder/decoder. When "
+            "--freeze_backbone_epochs > 0, freeze only for the first N epochs "
+            "and then train the full model."
         ),
     )
     p.add_argument(
         "--freeze_backbone_epochs",
         type=int,
-        default=5,
+        default=0,
         help=(
-            "For full fine-tuning BEVDet-OCC LiDAR variants, keep the loaded "
-            "OccAny backbone frozen for the first K epochs, then unfreeze. "
-            "Ignored when --freeze_backbone is set."
+            "Number of initial epochs to freeze the OccAny backbone. The "
+            "pointmap head remains trainable during this phase. If 0 and "
+            "--freeze_backbone is set, the backbone stays frozen for all epochs."
         ),
     )
 
@@ -165,6 +192,10 @@ def get_args_parser() -> argparse.ArgumentParser:
     #                         post-2D-fusion DPT-style dense depth head.
     #   - "bevdetocc_lidar_pointmap": same as bevdetocc_lidar plus a cloned
     #                         OccAny pointmap head after the 2D LiDAR fusion.
+    #   - "pointmap_postfusion_only": 2D LiDAR fusion + pointmap head only.
+    #   - "pointmap_original": original OccAny pointmap output only.
+    #   - "bevdetocc_lidar_pointmap_dense_depth": current pointmap model plus
+    #                         a post-2D-fusion dense depth auxiliary head.
     p.add_argument(
         "--exp",
         choices=[
@@ -174,6 +205,9 @@ def get_args_parser() -> argparse.ArgumentParser:
             "bevdetocc_lidar",
             "bevdetocc_lidar_dense_depth",
             "bevdetocc_lidar_pointmap",
+            "pointmap_postfusion_only",
+            "pointmap_original",
+            "bevdetocc_lidar_pointmap_dense_depth",
         ],
         default="light",
     )
@@ -244,6 +278,7 @@ def get_args_parser() -> argparse.ArgumentParser:
     # otherwise broken at per-GPU bs=1) and leaves the light head alone (it
     # uses GroupNorm). "on" forces it; "off" disables it everywhere.
     p.add_argument("--syncbn", choices=["auto", "on", "off"], default="auto")
+    add_pointmap_metric_args(p)
     return p
 
 
@@ -264,6 +299,8 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
             max_points_per_sweep=args.max_points_per_sweep,
             **common,
         )
+    if args.exp in POINTMAP_DENSE_DEPTH_DATA_EXPS:
+        return Kitti5FrameStage1DenseDepthDataset(**common)
     if args.exp == "bevdetocc_lidar":
         if not args.velodyne_root:
             raise ValueError("--velodyne_root is required when --exp=bevdetocc_lidar")
@@ -288,6 +325,8 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
 def _collate_fn(args):
     if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
         return collate_stage1_lidar_dense_depth
+    if args.exp in POINTMAP_DENSE_DEPTH_DATA_EXPS:
+        return collate_stage1_dense_depth
     if args.exp == "bevdetocc_lidar":
         return collate_stage1_lidar
     if args.exp == "monoscene_lidar":
@@ -334,36 +373,144 @@ def _state_dict_hash(state_dict: Dict[str, torch.Tensor]) -> str:
     return h.hexdigest()[:16]
 
 
-def _state_dict_without_backbone(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Checkpoint only trainable/non-frozen modules for the BEVDet-OCC branch."""
+def _filter_state_dict_without_backbone(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
     return {
         k: v
-        for k, v in model.state_dict().items()
-        if not k.startswith("backbone.")
+        for k, v in state_dict.items()
+        if not k.startswith("backbone.") or _is_backbone_pointmap_head_key(k)
     }
 
 
-def _backbone_frozen_for_epoch(args, epoch: int) -> bool:
-    """Return whether the OccAny backbone should be frozen at this epoch."""
-    if args.exp not in BEVDETOCC_LIDAR_EXPS:
-        return True
-    if bool(args.freeze_backbone):
-        return True
-    return int(getattr(args, "freeze_backbone_epochs", 0)) > 0 and epoch < int(
-        args.freeze_backbone_epochs
+def _state_dict_without_backbone(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Checkpoint only trainable/non-frozen modules when OccAny is frozen."""
+    return _filter_state_dict_without_backbone(model.state_dict())
+
+
+def _trainable_param_count(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _is_backbone_pointmap_head_key(name: str) -> bool:
+    return (
+        name == "backbone.decoder.pts3d_task_token"
+        or name.startswith("backbone.decoder.head_dec.")
+        or name.startswith("backbone.decoder._head_wrapper.")
     )
 
 
+def _is_occany_pointmap_head_param(name: str) -> bool:
+    return (
+        name == "decoder.pts3d_task_token"
+        or name.startswith("decoder.head_dec.")
+        or name.startswith("decoder._head_wrapper.")
+    )
+
+
+def _set_occany_backbone_frozen(
+    model: nn.Module,
+    freeze: bool,
+    *,
+    keep_pointmap_head_trainable: bool = True,
+) -> bool:
+    """Set OccAny backbone freeze state without touching external heads."""
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        return False
+    freeze = bool(freeze)
+    freeze_forward = freeze and not keep_pointmap_head_trainable
+    if hasattr(backbone, "freeze"):
+        backbone.freeze = freeze_forward
+    if hasattr(backbone, "_capturer"):
+        backbone._capturer.detach_output = freeze_forward
+
+    for name, param in backbone.named_parameters():
+        is_head = keep_pointmap_head_trainable and _is_occany_pointmap_head_param(name)
+        param.requires_grad = (not freeze) or is_head
+
+    if hasattr(model, "freeze_backbone"):
+        model.freeze_backbone = freeze
+    if freeze:
+        if hasattr(backbone, "encoder"):
+            backbone.encoder.eval()
+        if hasattr(backbone, "decoder"):
+            backbone.decoder.eval()
+    else:
+        backbone.train(model.training)
+    return freeze
+
+
+def _freeze_occany_backbone(model: nn.Module) -> bool:
+    return _set_occany_backbone_frozen(model, True)
+
+
 def _apply_backbone_freeze_state(model: nn.Module, args, epoch: int) -> bool:
-    """Apply permanent or staged BEVDet-OCC backbone freezing."""
-    frozen = _backbone_frozen_for_epoch(args, epoch)
-    if args.exp in BEVDETOCC_LIDAR_EXPS:
-        if hasattr(model, "set_freeze_backbone"):
-            model.set_freeze_backbone(frozen)
-        else:
-            for p in model.backbone.parameters():
-                p.requires_grad = not frozen
-    return frozen
+    if not bool(args.freeze_backbone):
+        return _set_occany_backbone_frozen(model, False)
+    freeze_epochs = int(args.freeze_backbone_epochs)
+    freeze = True if freeze_epochs == 0 else int(epoch) < freeze_epochs
+    return _set_occany_backbone_frozen(
+        model,
+        freeze,
+        keep_pointmap_head_trainable=(args.exp == "pointmap_original"),
+    )
+
+
+def _make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer | None:
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        return None
+    return torch.optim.AdamW(
+        trainable_params,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),
+    )
+
+
+def _optimizer_param_count(optimizer: torch.optim.Optimizer | None) -> int:
+    if optimizer is None:
+        return 0
+    return sum(p.numel() for group in optimizer.param_groups for p in group["params"])
+
+
+def _ensure_optimizer_matches_trainable(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    args,
+) -> torch.optim.Optimizer | None:
+    trainable_count = _trainable_param_count(model)
+    if trainable_count == 0:
+        if optimizer is not None:
+            print("[optimizer] no trainable parameters; dropping optimizer.")
+        return None
+    if optimizer is None or _optimizer_param_count(optimizer) != trainable_count:
+        optimizer = _make_optimizer(model, args)
+        print(f"[optimizer] rebuilt with trainable params={trainable_count:,}.")
+    return optimizer
+
+
+def _ddp_kwargs(args) -> Dict:
+    kwargs = dict(device_ids=[args.gpu])
+    if args.exp in LIDAR_EXPS or int(args.freeze_backbone_epochs) > 0:
+        kwargs.update(find_unused_parameters=True, static_graph=False)
+    else:
+        kwargs.update(find_unused_parameters=False, static_graph=True)
+    return kwargs
+
+
+def _wrap_distributed_if_needed(
+    model: nn.Module,
+    args,
+) -> tuple[nn.Module, nn.Module]:
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if args.distributed and trainable_params:
+        wrapped = nn.parallel.DistributedDataParallel(model, **_ddp_kwargs(args))
+        return wrapped, wrapped.module
+    if args.distributed and not trainable_params:
+        print("[ddp] skipped DDP wrapping because no parameters require grad.")
+    return model, model
 
 
 def _move_views_to_device(views: List[Dict[str, torch.Tensor]], device: torch.device):
@@ -393,6 +540,17 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     """Dispatch the model forward to match each experiment's signature."""
     views = _move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
+    if args.exp == "pointmap_postfusion_only":
+        return model(
+            views,
+            T_target_from_refcam,
+            _move_points_to_device(batch["points_per_frame"], device),
+            batch["T_cam_from_velo"].to(device, non_blocking=True),
+            batch["K_per_frame"].to(device, non_blocking=True),
+            batch["image_hw"].to(device, non_blocking=True),
+        )
+    if args.exp == "pointmap_original":
+        return model(views, T_target_from_refcam)
     if args.exp in BEVDETOCC_LIDAR_EXPS:
         return model(
             views,
@@ -449,7 +607,10 @@ def _maybe_add_dense_depth_loss(
     batch: Dict,
     args,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
-    if args.exp != "bevdetocc_lidar_dense_depth" or not bool(
+    if args.exp not in (
+        "bevdetocc_lidar_dense_depth",
+        "bevdetocc_lidar_pointmap_dense_depth",
+    ) or not bool(
         getattr(args, "dense_depth_supervision", False)
     ):
         return loss, details
@@ -484,6 +645,170 @@ def _stack_cam2world_from_views(batch: Dict, device: torch.device) -> torch.Tens
     )
 
 
+_POINTMAP_OCCANY_CRITERIA: Dict[tuple, nn.Module] = {}
+
+
+def _pointmap_K_per_frame(batch: Dict, device: torch.device) -> torch.Tensor:
+    if "K_per_frame" in batch:
+        return batch["K_per_frame"].to(device=device, dtype=torch.float32, non_blocking=True)
+    return torch.stack(
+        [
+            v["camera_intrinsics"].to(device=device, dtype=torch.float32, non_blocking=True)
+            for v in batch["views"]
+        ],
+        dim=1,
+    )
+
+
+def _occany_pointmap_criterion(args, device: torch.device, *, is_train: bool) -> nn.Module:
+    key = (
+        str(device),
+        bool(is_train),
+        float(args.pointmap_conf_alpha),
+    )
+    criterion = _POINTMAP_OCCANY_CRITERIA.get(key)
+    if criterion is None:
+        pixel_loss = Regr3D_multiview(
+            L21,
+            norm_mode="?avg_dis",
+            loss_in_log=False,
+            gt_scale=not is_train,
+        )
+        if is_train:
+            criterion = ConfLoss_multiview(
+                pixel_loss,
+                alpha=float(args.pointmap_conf_alpha),
+            )
+        else:
+            criterion = pixel_loss
+        criterion = criterion.to(device)
+        _POINTMAP_OCCANY_CRITERIA[key] = criterion
+    return criterion
+
+
+def _occany_pointmap_gt_pred(
+    out: Dict,
+    batch: Dict,
+    device: torch.device,
+) -> tuple[List[Dict[str, torch.Tensor]], Dict[str, torch.Tensor], torch.Tensor]:
+    required = ("pointmap_pts3d", "pointmap_pts3d_local", "pointmap_conf")
+    missing = [k for k in required if k not in out]
+    if missing:
+        raise RuntimeError(f"Pointmap supervision expected model output keys {missing}.")
+    if "dense_depth" not in batch:
+        raise RuntimeError(
+            "Pointmap supervision requires batch['dense_depth']; use the dense-depth "
+            "dataset/collate path."
+        )
+
+    pred_pts3d = out["pointmap_pts3d"].float()
+    pred_pts3d_local = out["pointmap_pts3d_local"].float()
+    if pred_pts3d.shape != pred_pts3d_local.shape:
+        raise RuntimeError(
+            f"pred global/local pointmap shapes differ: {tuple(pred_pts3d.shape)} vs "
+            f"{tuple(pred_pts3d_local.shape)}."
+        )
+    if pred_pts3d.ndim != 5 or pred_pts3d.shape[-1] != 3:
+        raise RuntimeError(f"pred pointmaps must be (B,N,H,W,3), got {tuple(pred_pts3d.shape)}.")
+
+    dense_depth = batch["dense_depth"].to(device=device, dtype=torch.float32, non_blocking=True)
+    K_per_frame = _pointmap_K_per_frame(batch, device)
+    cam2world_per_frame = _stack_cam2world_from_views(batch, device)
+    gt_ref, _gt_local, valid = _pointmap_targets_from_depth(
+        dense_depth,
+        K_per_frame,
+        cam2world_per_frame,
+    )
+    if pred_pts3d.shape != gt_ref.shape:
+        raise RuntimeError(
+            f"pred pointmap shape {tuple(pred_pts3d.shape)} does not match GT "
+            f"{tuple(gt_ref.shape)}."
+        )
+
+    frame_mask = batch.get("dense_depth_frame_mask")
+    if frame_mask is not None:
+        fm = frame_mask.to(device=device, dtype=torch.bool, non_blocking=True).view(
+            dense_depth.shape[0], dense_depth.shape[1], 1, 1
+        )
+        valid = valid & fm
+
+    conf = out["pointmap_conf"].to(device=device, dtype=torch.float32)
+    if conf.ndim == pred_pts3d.ndim and conf.shape[-1] == 1:
+        conf = conf[..., 0]
+    if conf.shape != valid.shape:
+        raise RuntimeError(
+            f"pred_conf shape {tuple(conf.shape)} does not match valid mask "
+            f"{tuple(valid.shape)}."
+        )
+
+    T_ref_from_world = torch.linalg.inv(cam2world_per_frame[:, 0])
+    T_ref_from_cam = T_ref_from_world[:, None] @ cam2world_per_frame
+    is_metric_scale = torch.ones(
+        dense_depth.shape[0],
+        device=device,
+        dtype=torch.bool,
+    )
+    gt_views = [
+        {
+            "pts3d": gt_ref[:, view_idx],
+            "valid_mask": valid[:, view_idx],
+            "camera_pose": T_ref_from_cam[:, view_idx],
+            "is_metric_scale": is_metric_scale,
+        }
+        for view_idx in range(dense_depth.shape[1])
+    ]
+    pred = {
+        "pts3d": pred_pts3d,
+        "pts3d_local": pred_pts3d_local,
+        "conf": conf,
+    }
+    return gt_views, pred, valid
+
+
+def _pointmap_occany_loss(
+    out: Dict,
+    batch: Dict,
+    args,
+    *,
+    is_train: bool,
+) -> tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    device = out["pointmap_pts3d"].device
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        gt_views, pred, valid = _occany_pointmap_gt_pred(out, batch, device)
+        valid_count = valid.sum()
+        if not bool(valid_count.item()):
+            zero = pred["pts3d"].sum() * 0.0
+            return zero, zero, {
+                "pointmap": 0.0,
+                "pointmap_weighted": 0.0,
+                "pointmap_pts3d": 0.0,
+                "pointmap_pts3d_local": 0.0,
+                "pointmap_conf_loss_g": 0.0,
+                "pointmap_conf_loss_l": 0.0,
+                "pointmap_valid": 0.0,
+            }
+
+        criterion = _occany_pointmap_criterion(args, device, is_train=is_train)
+        raw_loss, occany_details = criterion(gt_views, pred)
+        weighted = float(args.pointmap_loss_weight) * raw_loss
+
+    pointmap_details = {
+        "pointmap": float(raw_loss.detach()),
+        "pointmap_weighted": float(weighted.detach()),
+        "pointmap_valid": float(valid_count.detach()),
+    }
+    for key, value in occany_details.items():
+        if key == "Regr3D_multiview_pts3d":
+            pointmap_details["pointmap_pts3d"] = float(value)
+        elif key == "Regr3D_multiview_pts3d_local":
+            pointmap_details["pointmap_pts3d_local"] = float(value)
+        elif key in ("conf_loss_g", "conf_loss_l"):
+            pointmap_details[f"pointmap_{key}"] = float(value)
+        else:
+            pointmap_details[f"pointmap_{key}"] = float(value)
+    return weighted, raw_loss, pointmap_details
+
+
 def _maybe_add_pointmap_loss(
     loss: torch.Tensor,
     details: Dict[str, float],
@@ -493,35 +818,18 @@ def _maybe_add_pointmap_loss(
     *,
     is_train: bool,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
-    if args.exp != "bevdetocc_lidar_pointmap" or not bool(
+    if args.exp not in (
+        "bevdetocc_lidar_pointmap",
+        "bevdetocc_lidar_pointmap_dense_depth",
+    ) or not bool(
         getattr(args, "pointmap_supervision", False)
     ):
         return loss, details
-    required = ("pointmap_pts3d", "pointmap_pts3d_local", "pointmap_conf")
-    missing = [k for k in required if k not in out]
-    if missing:
-        raise RuntimeError(f"Pointmap supervision expected model output keys {missing}.")
-    if "dense_depth" not in batch:
-        raise RuntimeError(
-            "Pointmap supervision requires batch['dense_depth']; use the dense-depth "
-            "LiDAR dataset/collate path."
-        )
-
-    device = out["pointmap_pts3d"].device
-    frame_mask = batch.get("dense_depth_frame_mask")
-    if frame_mask is not None:
-        frame_mask = frame_mask.to(device=device, non_blocking=True)
-    pointmap_weighted, _pointmap_raw, pointmap_details = pointmap_reconstruction_loss(
-        pred_pts3d=out["pointmap_pts3d"],
-        pred_pts3d_local=out["pointmap_pts3d_local"],
-        pred_conf=out["pointmap_conf"],
-        dense_depth=batch["dense_depth"].to(device=device, non_blocking=True),
-        K_per_frame=batch["K_per_frame"].to(device=device, non_blocking=True),
-        cam2world_per_frame=_stack_cam2world_from_views(batch, device),
-        frame_mask=frame_mask,
-        loss_weight=float(args.pointmap_loss_weight),
-        conf_alpha=float(args.pointmap_conf_alpha),
-        gt_scale=not is_train,
+    pointmap_weighted, _pointmap_raw, pointmap_details = _pointmap_occany_loss(
+        out,
+        batch,
+        args,
+        is_train=is_train,
     )
     prefix = "pointmap_train" if is_train else "pointmap_eval"
     details = dict(details)
@@ -531,12 +839,47 @@ def _maybe_add_pointmap_loss(
     return loss + pointmap_weighted, details
 
 
+def _pointmap_only_loss(
+    out: Dict,
+    batch: Dict,
+    args,
+    *,
+    is_train: bool,
+) -> tuple[torch.Tensor, Dict[str, float]]:
+    weighted, raw, details = _pointmap_occany_loss(
+        out,
+        batch,
+        args,
+        is_train=is_train,
+    )
+    prefix = "pointmap_train" if is_train else "pointmap_eval"
+    out_details = {
+        f"{prefix}_loss": float(raw.detach()),
+        f"{prefix}_weighted": float(weighted.detach()),
+    }
+    for key, value in details.items():
+        suffix = "loss" if key == "pointmap" else key.removeprefix("pointmap_")
+        out_details[f"{prefix}_{suffix}"] = value
+    return weighted, out_details
+
+
 def _sanitize_metric_key(name: str) -> str:
     return str(name).replace(" ", "_").replace("-", "_").replace("/", "_")
 
 
 def _float_list(values) -> List[float]:
     return [float(v) for v in values]
+
+
+def _gather_pointmap_metric_states(local_state: Dict, args) -> List[Dict] | None:
+    if not getattr(args, "distributed", False):
+        return [local_state]
+    import torch.distributed as dist
+
+    world_size = misc.get_world_size()
+    gathered = [None for _ in range(world_size)]
+    dist.all_gather_object(gathered, local_state)
+    return gathered
 
 
 def _per_class_iou_dict(stats: Dict) -> Dict[str, float]:
@@ -592,17 +935,20 @@ def train_one_epoch(
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = f"Epoch [{epoch}]"
     accum = args.accum_iter
-    optimizer.zero_grad()
+    if optimizer is not None:
+        optimizer.zero_grad()
 
     if hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch)
 
     for step, batch in enumerate(metric_logger.log_every(loader, args.print_freq, header)):
         epoch_f = epoch + step / max(len(loader), 1)
-        if step % accum == 0:
+        if optimizer is not None and step % accum == 0:
             _adjust_lr(optimizer, epoch_f, args)
 
-        target = batch["voxel_label"].to(device, non_blocking=True)
+        target = None
+        if args.exp not in POINTMAP_ONLY_EXPS:
+            target = batch["voxel_label"].to(device, non_blocking=True)
 
         amp_dtype = (
             torch.bfloat16 if args.amp == "bf16" else (torch.float16 if args.amp == "fp16" else None)
@@ -615,7 +961,9 @@ def train_one_epoch(
 
         with ctx:
             out = _model_forward(model, batch, device, args)
-            if args.exp in MONOSCENE_LOSS_EXPS:
+            if args.exp in POINTMAP_ONLY_EXPS:
+                loss, details = _pointmap_only_loss(out, batch, args, is_train=True)
+            elif args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, details = criterion(out, target, cp)
             elif args.exp in BEVDETOCC_LIDAR_EXPS:
@@ -632,16 +980,18 @@ def train_one_epoch(
             raise RuntimeError(f"Loss is {loss_value}; details={details}; stopping.")
         loss = loss / accum
 
-        loss_scaler(
-            loss,
-            optimizer,
-            parameters=[p for p in model.parameters() if p.requires_grad],
-            update_grad=(step + 1) % accum == 0,
-        )
-        if (step + 1) % accum == 0:
-            optimizer.zero_grad()
+        trainable_now = [p for p in model.parameters() if p.requires_grad]
+        if optimizer is not None and loss.requires_grad and trainable_now:
+            loss_scaler(
+                loss,
+                optimizer,
+                parameters=trainable_now,
+                update_grad=(step + 1) % accum == 0,
+            )
+            if (step + 1) % accum == 0:
+                optimizer.zero_grad()
 
-        lr = optimizer.param_groups[0]["lr"]
+        lr = optimizer.param_groups[0]["lr"] if optimizer is not None else 0.0
         metric_logger.update(loss=loss_value, lr=lr, **details)
 
         if log_writer is not None and (step + 1) % accum == 0:
@@ -667,13 +1017,17 @@ def eval_one_epoch(
     log_writer,
 ):
     model.eval()
-    ssc = SSCMetrics(
-        n_classes=20,
-        class_names=list(KITTI_SSC_CLASS_NAMES),
-        other_class=None,
-        ignore_other_class_in_mIoU=False,
-        empty_class=0,
-    )
+    eval_ssc = args.exp not in POINTMAP_ONLY_EXPS
+    ssc = None
+    if eval_ssc:
+        ssc = SSCMetrics(
+            n_classes=20,
+            class_names=list(KITTI_SSC_CLASS_NAMES),
+            other_class=None,
+            ignore_other_class_in_mIoU=False,
+            empty_class=0,
+        )
+    pointmap_accum = PointmapMetricAccumulator(args) if args.exp in POINTMAP_QUALITY_EXPS else None
     losses_total = 0.0
     details_total: Dict[str, float] = {}
     n_batches = 0
@@ -681,7 +1035,9 @@ def eval_one_epoch(
         torch.bfloat16 if args.amp == "bf16" else (torch.float16 if args.amp == "fp16" else None)
     )
     for batch in loader:
-        target = batch["voxel_label"].to(device, non_blocking=True)
+        target = None
+        if eval_ssc:
+            target = batch["voxel_label"].to(device, non_blocking=True)
 
         ctx = (
             torch.autocast("cuda", dtype=amp_dtype)
@@ -690,7 +1046,10 @@ def eval_one_epoch(
         )
         with ctx:
             out = _model_forward(model, batch, device, args)
-            if args.exp in MONOSCENE_LOSS_EXPS:
+            if args.exp in POINTMAP_ONLY_EXPS:
+                loss, _details = _pointmap_only_loss(out, batch, args, is_train=False)
+                logits = None
+            elif args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, _details = criterion(out, target, cp)
                 logits = out["ssc_logit"]
@@ -705,14 +1064,23 @@ def eval_one_epoch(
             else:
                 loss, _details = criterion(out, target)
                 logits = out
+        if pointmap_accum is not None:
+            update_pointmap_metrics_from_batch(
+                pointmap_accum,
+                out,
+                batch,
+                device,
+                _stack_cam2world_from_views(batch, device),
+            )
         losses_total += float(loss.detach())
         for k, v in _details.items():
             details_total[k] = details_total.get(k, 0.0) + float(v)
         n_batches += 1
 
-        pred = logits.argmax(dim=1).cpu().numpy()
-        gt = target.cpu().numpy()
-        ssc.add_batch(pred.astype(np.int64), gt.astype(np.int64))
+        if eval_ssc:
+            pred = logits.argmax(dim=1).cpu().numpy()
+            gt = target.cpu().numpy()
+            ssc.add_batch(pred.astype(np.int64), gt.astype(np.int64))
 
     # DDP: all-reduce loss + SSC counters across ranks before computing stats.
     if getattr(args, "distributed", False):
@@ -732,14 +1100,25 @@ def eval_one_epoch(
         for k in sorted(details_total):
             details_total[k] = _reduce_scalar(details_total[k])
         n_batches = int(_reduce_scalar(n_batches))
-        ssc.tps = _reduce_np(ssc.tps)
-        ssc.fps = _reduce_np(ssc.fps)
-        ssc.fns = _reduce_np(ssc.fns)
-        ssc.completion_tp = _reduce_scalar(ssc.completion_tp)
-        ssc.completion_fp = _reduce_scalar(ssc.completion_fp)
-        ssc.completion_fn = _reduce_scalar(ssc.completion_fn)
+        if eval_ssc:
+            ssc.tps = _reduce_np(ssc.tps)
+            ssc.fps = _reduce_np(ssc.fps)
+            ssc.fns = _reduce_np(ssc.fns)
+            ssc.completion_tp = _reduce_scalar(ssc.completion_tp)
+            ssc.completion_fp = _reduce_scalar(ssc.completion_fp)
+            ssc.completion_fn = _reduce_scalar(ssc.completion_fn)
 
-    stats = ssc.get_stats()
+    stats = ssc.get_stats() if eval_ssc else {}
+    if pointmap_accum is not None:
+        local_state = pointmap_accum.state_dict()
+        gathered = _gather_pointmap_metric_states(local_state, args)
+        if getattr(args, "distributed", False):
+            import torch.distributed as dist
+
+            dist.barrier()
+        assert gathered is not None
+        pm_metrics = PointmapMetricAccumulator.from_states(args, gathered).finalize()
+        stats.update({f"pointmap_quality_{k}": v for k, v in pm_metrics.items()})
     loss_avg = losses_total / max(n_batches, 1)
     detail_avgs = {k: v / max(n_batches, 1) for k, v in details_total.items()}
     if log_writer is not None:
@@ -747,31 +1126,39 @@ def eval_one_epoch(
         log_writer.add_scalar("val/loss", loss_avg, it)
         for k, v in detail_avgs.items():
             log_writer.add_scalar(f"val/{k}", v, it)
-        log_writer.add_scalar("val/iou", stats["iou"], it)
-        log_writer.add_scalar("val/mIoU", stats["mIoU"], it)
-        log_writer.add_scalar("val/precision", stats["precision"], it)
-        log_writer.add_scalar("val/recall", stats["recall"], it)
-        for class_name, iou in _per_class_iou_dict(stats).items():
-            log_writer.add_scalar(f"val/iou_class/{class_name}", iou, it)
-    print(
-        f"Val [{epoch}] loss={loss_avg:.4f} IoU={stats['iou']*100:.2f} "
-        f"mIoU={stats['mIoU']*100:.2f} P={stats['precision']*100:.2f} "
-        f"R={stats['recall']*100:.2f}"
-    )
+        if eval_ssc:
+            log_writer.add_scalar("val/iou", stats["iou"], it)
+            log_writer.add_scalar("val/mIoU", stats["mIoU"], it)
+            log_writer.add_scalar("val/precision", stats["precision"], it)
+            log_writer.add_scalar("val/recall", stats["recall"], it)
+            for class_name, iou in _per_class_iou_dict(stats).items():
+                log_writer.add_scalar(f"val/iou_class/{class_name}", iou, it)
+        for k, v in stats.items():
+            if k.startswith("pointmap_quality_") and isinstance(v, (int, float)):
+                log_writer.add_scalar(f"val/{k}", v, it)
+    if eval_ssc:
+        print(
+            f"Val [{epoch}] loss={loss_avg:.4f} IoU={stats['iou']*100:.2f} "
+            f"mIoU={stats['mIoU']*100:.2f} P={stats['precision']*100:.2f} "
+            f"R={stats['recall']*100:.2f}"
+        )
+    else:
+        pm_l2 = stats.get("pointmap_quality_pts3d_l2", float("nan"))
+        pm_depth = stats.get("pointmap_quality_depth_absrel", float("nan"))
+        pm_chamfer = stats.get("pointmap_quality_chamfer_distance", float("nan"))
+        print(
+            f"Val [{epoch}] loss={loss_avg:.4f} "
+            f"pointmap_l2={pm_l2:.4f} depth_absrel={pm_depth:.4f} "
+            f"chamfer={pm_chamfer:.4f}"
+        )
     return dict(loss=loss_avg, **detail_avgs, **stats)
 
 
 def main():
     args = get_args_parser().parse_args()
-    if args.freeze_backbone is None:
-        args.freeze_backbone = args.exp not in BEVDETOCC_LIDAR_EXPS
     args.freeze_backbone_epochs = int(args.freeze_backbone_epochs)
     if args.freeze_backbone_epochs < 0:
         raise ValueError("--freeze_backbone_epochs must be >= 0.")
-    if args.exp not in BEVDETOCC_LIDAR_EXPS and not args.freeze_backbone:
-        raise ValueError(
-            "--no-freeze_backbone is currently only supported for BEVDet-OCC LiDAR variants."
-        )
 
     misc.init_distributed_mode_jz(args)
     # xFormers C++ ext is unavailable on this cu126 env; fall back to PyTorch SDPA.
@@ -798,7 +1185,13 @@ def main():
     else:
         backbone_dtype = torch.float32
 
-    if args.exp == "bevdetocc_lidar_pointmap":
+    if args.exp == "pointmap_original":
+        model_cls = Stage1PointmapOriginalModel
+    elif args.exp == "pointmap_postfusion_only":
+        model_cls = Stage1PointmapPostFusionOnlyModel
+    elif args.exp == "bevdetocc_lidar_pointmap_dense_depth":
+        model_cls = Stage1SSCBEVDetOccLidarPointmapDenseDepthModel
+    elif args.exp == "bevdetocc_lidar_pointmap":
         model_cls = Stage1SSCBEVDetOccLidarPointmapModel
     elif args.exp == "bevdetocc_lidar_dense_depth":
         model_cls = Stage1SSCBEVDetOccLidarDenseDepthModel
@@ -819,11 +1212,14 @@ def main():
         backbone_img_size=(args.height, args.width),
         backbone_dtype=backbone_dtype,
     )
-    if args.exp in BEVDETOCC_LIDAR_EXPS:
+    if args.exp in (*BEVDETOCC_LIDAR_EXPS, "pointmap_postfusion_only"):
         model_kwargs["fusion_attn_type"] = "cross"
         model_kwargs["num_frames"] = args.num_frames
         model_kwargs["freeze_backbone"] = args.freeze_backbone
-    if args.exp == "bevdetocc_lidar_dense_depth":
+    if args.exp == "pointmap_original":
+        model_kwargs["num_frames"] = args.num_frames
+        model_kwargs["freeze_backbone"] = args.freeze_backbone
+    if args.exp in ("bevdetocc_lidar_dense_depth", "bevdetocc_lidar_pointmap_dense_depth"):
         model_kwargs["dense_depth_features"] = args.dense_depth_features
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
@@ -844,6 +1240,13 @@ def main():
         model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
+    if args.exp in POINTMAP_ONLY_EXPS:
+        print(
+            f"[pointmap-only] weight={args.pointmap_loss_weight} "
+            f"conf_alpha={args.pointmap_conf_alpha}"
+        )
+        if args.exp == "pointmap_postfusion_only":
+            print("[fusion] attn_type=cross (pointmap-only post-fusion branch)")
     if args.exp in BEVDETOCC_LIDAR_EXPS:
         print("[fusion] attn_type=cross (forced for BEVDet-OCC LiDAR branch)")
         print("[backend] LSS half-grid -> LiDAR memory -> NATTEN -> BEVDet CustomResNet3D/LSSFPN3D")
@@ -851,13 +1254,13 @@ def main():
             f"[depth_supervision] enabled={args.depth_supervision} "
             f"weight={args.depth_loss_weight}"
         )
-        if args.exp == "bevdetocc_lidar_dense_depth":
+        if args.exp in ("bevdetocc_lidar_dense_depth", "bevdetocc_lidar_pointmap_dense_depth"):
             print(
                 f"[dense_depth] enabled={args.dense_depth_supervision} "
                 f"weight={args.dense_depth_loss_weight} "
                 f"features={args.dense_depth_features}"
             )
-        if args.exp == "bevdetocc_lidar_pointmap":
+        if args.exp in ("bevdetocc_lidar_pointmap", "bevdetocc_lidar_pointmap_dense_depth"):
             print(
                 f"[pointmap] enabled={args.pointmap_supervision} "
                 f"weight={args.pointmap_loss_weight} "
@@ -881,31 +1284,27 @@ def main():
             f"alpha_init={args.memory_voxel_alpha_init}"
         )
 
-    # Freeze the OccAny backbone unless full fine-tuning is requested. For
-    # BEVDet-OCC full fine-tuning, optimizer params remain visible so staged
-    # freezing can unfreeze the backbone after --freeze_backbone_epochs.
-    # Trainable params in frozen mode:
-    #   light:            lifting + occ_head
-    #   monoscene:        lifting + occ_head (incl. monoscene adapter)
-    #   monoscene_lidar:  lifting + occ_head + fusion
-    #                      (+ optional sorted-3D self-attention / post-lift VFE)
-    if args.freeze_backbone:
-        for p in model.backbone.parameters():
-            p.requires_grad = False
-
+    # Apply initial OccAny backbone freeze state before DDP/optimizer creation.
+    # External heads stay trainable; for pointmap_original the original OccAny
+    # decoder pointmap head is also kept trainable during frozen epochs.
+    backbone_frozen = _apply_backbone_freeze_state(model, args, 0)
     backbone_hash = (
-        _state_dict_hash(model.backbone.state_dict()) if args.freeze_backbone else None
+        _state_dict_hash(model.backbone.state_dict())
+        if hasattr(model, "backbone")
+        else None
     )
-    print(f"[backbone] freeze={args.freeze_backbone}")
-    if args.exp in BEVDETOCC_LIDAR_EXPS and not args.freeze_backbone:
+    print(f"[backbone] initial freeze={backbone_frozen} (OccAny reconstruction encoder/decoder)")
+    if args.freeze_backbone and args.freeze_backbone_epochs:
         print(
-            f"[backbone] staged_freeze_epochs={args.freeze_backbone_epochs} "
-            "(0 disables staged freezing)"
+            f"[backbone] freeze_backbone_epochs={args.freeze_backbone_epochs} "
+            "then full-model training."
         )
+    elif args.freeze_backbone:
+        print("[backbone] frozen for all epochs.")
+    else:
+        print("[backbone] trainable from epoch 0.")
     if backbone_hash is not None:
         print(f"Backbone state_dict hash: {backbone_hash}")
-    else:
-        print("Backbone state_dict hash: disabled for full fine-tuning")
 
     # Convert BN -> SyncBN before DDP wrap. At per-GPU bs=1 the MonoScene
     # head's BatchNorm3d layers see one-sample stats per forward, which both
@@ -916,7 +1315,12 @@ def main():
         args.syncbn == "on"
         or (
             args.syncbn == "auto"
-            and args.exp in ("monoscene", "monoscene_lidar", *BEVDETOCC_LIDAR_EXPS)
+            and args.exp in (
+                "monoscene",
+                "monoscene_lidar",
+                *BEVDETOCC_LIDAR_EXPS,
+                *POINTMAP_ONLY_EXPS,
+            )
         )
     )
     if syncbn_on:
@@ -925,28 +1329,16 @@ def main():
     else:
         print(f"[syncbn] disabled (mode={args.syncbn}, distributed={args.distributed}).")
 
-    if args.distributed:
-        # monoscene_lidar's fusion sub-modules may not fire on a batch with no
-        # valid voxel projections, and the per-sample point cloud changes which
-        # windows are active — both incompatible with static_graph=True.
-        ddp_kwargs = dict(device_ids=[args.gpu])
-        if args.exp in LIDAR_EXPS:
-            ddp_kwargs.update(find_unused_parameters=True, static_graph=False)
-        else:
-            ddp_kwargs.update(find_unused_parameters=False, static_graph=True)
-        model = nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
-        model_to_save = model.module
-    else:
-        model_to_save = model
+    model, model_to_save = _wrap_distributed_if_needed(model, args)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     total_params = sum(p.numel() for p in model.parameters())
     train_count = sum(p.numel() for p in trainable_params)
     print(f"Trainable params: {train_count:,} / {total_params:,}")
 
-    optimizer = torch.optim.AdamW(
-        trainable_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
-    )
+    optimizer = _make_optimizer(model, args)
+    if optimizer is None:
+        print("[optimizer] no trainable parameters; running eval/log-only epochs.")
     loss_scaler = NativeScaler(enabled=(args.amp == "fp16"))
     if args.exp in MONOSCENE_LOSS_EXPS:
         criterion = MonoSceneSSCLoss().to(device)
@@ -960,6 +1352,7 @@ def main():
     val_loader = _build_loader(args, val_dataset, train=False)
 
     start_epoch = 0
+    optimizer_state_to_load = None
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         prev_hash = ckpt.get("backbone_hash", None)
@@ -968,9 +1361,15 @@ def main():
             ckpt_freeze_backbone = bool(ckpt_args.get("freeze_backbone", True))
         else:
             ckpt_freeze_backbone = bool(getattr(ckpt_args, "freeze_backbone", True))
+        frozen_for_all_epochs = bool(args.freeze_backbone) and int(args.freeze_backbone_epochs) == 0
+        ckpt_frozen_for_all_epochs = ckpt_freeze_backbone and int(
+            ckpt_args.get("freeze_backbone_epochs", 0)
+            if isinstance(ckpt_args, dict)
+            else getattr(ckpt_args, "freeze_backbone_epochs", 0)
+        ) == 0
         if (
-            args.freeze_backbone
-            and ckpt_freeze_backbone
+            frozen_for_all_epochs
+            and ckpt_frozen_for_all_epochs
             and prev_hash is not None
             and prev_hash != backbone_hash
         ):
@@ -979,17 +1378,25 @@ def main():
                 f"checkpoint expected {prev_hash}, current --occany_ckpt gives {backbone_hash}. "
                 "Refusing to resume — the frozen backbone has changed."
             )
-        if args.exp in BEVDETOCC_LIDAR_EXPS and "model" in ckpt:
-            status = model_to_save.load_state_dict(ckpt["model"], strict=False)
+        if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS) and "model" in ckpt:
+            if frozen_for_all_epochs and ckpt_frozen_for_all_epochs:
+                model_state = _filter_state_dict_without_backbone(ckpt["model"])
+            else:
+                model_state = ckpt["model"]
+            status = model_to_save.load_state_dict(model_state, strict=False)
             print(
                 f"[resume:{args.exp}] loaded model state: "
                 f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
             )
-        elif args.exp not in BEVDETOCC_LIDAR_EXPS and "lifting" in ckpt:
+        elif args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS) and "lifting" in ckpt:
             model_to_save.lifting.load_state_dict(ckpt["lifting"], strict=False)
-        if args.exp not in BEVDETOCC_LIDAR_EXPS and "occ_head" in ckpt:
+        if args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS) and "occ_head" in ckpt:
             model_to_save.occ_head.load_state_dict(ckpt["occ_head"], strict=False)
-        if args.exp not in BEVDETOCC_LIDAR_EXPS and "fusion" in ckpt and hasattr(model_to_save, "fusion"):
+        if (
+            args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS)
+            and "fusion" in ckpt
+            and hasattr(model_to_save, "fusion")
+        ):
             model_to_save.fusion.load_state_dict(ckpt["fusion"], strict=False)
         if (
             "post_lift_lidar" in ckpt
@@ -1012,21 +1419,30 @@ def main():
             model_to_save.memory_fusion.load_state_dict(
                 ckpt["memory_fusion"], strict=False
             )
-        if "optimizer" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            except Exception as e:
-                print("Optimizer load failed:", e)
+        optimizer_state_to_load = ckpt.get("optimizer", None)
         if "scaler" in ckpt:
             loss_scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt.get("epoch", -1) + 1
         print(f"Resumed from {args.resume}; epoch={start_epoch}")
+
+    resumed_backbone_frozen = _apply_backbone_freeze_state(model_to_save, args, start_epoch)
+    optimizer = _ensure_optimizer_matches_trainable(model, optimizer, args)
+    if optimizer is not None and optimizer_state_to_load is not None:
+        try:
+            optimizer.load_state_dict(optimizer_state_to_load)
+        except Exception as e:
+            print("Optimizer load failed:", e)
+    print(
+        f"[backbone] start_epoch={start_epoch} freeze={resumed_backbone_frozen} "
+        f"trainable={_trainable_param_count(model_to_save):,}"
+    )
 
     log_writer = (
         SummaryWriter(log_dir=args.output_dir) if misc.is_main_process() else None
     )
 
     if args.eval_only:
+        _apply_backbone_freeze_state(model_to_save, args, start_epoch)
         eval_one_epoch(model, val_loader, criterion, device, start_epoch, args, log_writer)
         return
 
@@ -1034,12 +1450,18 @@ def main():
     t0 = time.time()
     last_backbone_frozen = None
     for epoch in range(start_epoch, args.epochs):
-        if args.exp in BEVDETOCC_LIDAR_EXPS:
-            backbone_frozen = _apply_backbone_freeze_state(model_to_save, args, epoch)
-            if backbone_frozen != last_backbone_frozen:
-                phase = "permanent" if args.freeze_backbone else "staged"
-                print(f"[backbone] epoch={epoch} freeze={backbone_frozen} ({phase})")
-            last_backbone_frozen = backbone_frozen
+        backbone_frozen = _apply_backbone_freeze_state(model_to_save, args, epoch)
+        if backbone_frozen != last_backbone_frozen:
+            if args.distributed:
+                if isinstance(model, nn.parallel.DistributedDataParallel):
+                    model = model.module
+                model, model_to_save = _wrap_distributed_if_needed(model, args)
+            print(
+                f"[backbone] epoch={epoch} freeze={backbone_frozen} "
+                f"trainable={_trainable_param_count(model_to_save):,}"
+            )
+            optimizer = _ensure_optimizer_matches_trainable(model, optimizer, args)
+        last_backbone_frozen = backbone_frozen
 
         train_stats = train_one_epoch(
             model, train_loader, optimizer, loss_scaler, criterion, device, epoch, args, log_writer
@@ -1052,15 +1474,13 @@ def main():
             )
 
         if misc.is_main_process():
-            if args.exp in BEVDETOCC_LIDAR_EXPS:
-                model_state = (
-                    _state_dict_without_backbone(model_to_save)
-                    if args.freeze_backbone
-                    else model_to_save.state_dict()
-                )
+            if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS):
+                if args.freeze_backbone and int(args.freeze_backbone_epochs) == 0:
+                    model_state = _state_dict_without_backbone(model_to_save)
+                else:
+                    model_state = model_to_save.state_dict()
                 ckpt_payload = {
                     "model": model_state,
-                    "optimizer": optimizer.state_dict(),
                     "scaler": loss_scaler.state_dict(),
                     "epoch": epoch,
                     "args": vars(args),
@@ -1070,29 +1490,30 @@ def main():
                 ckpt_payload = {
                     "lifting": model_to_save.lifting.state_dict(),
                     "occ_head": model_to_save.occ_head.state_dict(),
-                    "optimizer": optimizer.state_dict(),
                     "scaler": loss_scaler.state_dict(),
                     "epoch": epoch,
                     "args": vars(args),
                     "backbone_hash": backbone_hash,
                 }
-                if args.exp == "monoscene_lidar":
-                    ckpt_payload["fusion"] = model_to_save.fusion.state_dict()
-                    if model_to_save.post_lift_lidar is not None:
-                        ckpt_payload["post_lift_lidar"] = (
-                            model_to_save.post_lift_lidar.state_dict()
-                        )
-                        ckpt_payload["post_lift_fuse"] = (
-                            model_to_save.post_lift_fuse.state_dict()
-                        )
-                    if model_to_save.memory_fusion is not None:
-                        ckpt_payload["memory_fusion"] = (
-                            model_to_save.memory_fusion.state_dict()
-                        )
+            if optimizer is not None:
+                ckpt_payload["optimizer"] = optimizer.state_dict()
+            if args.exp == "monoscene_lidar":
+                ckpt_payload["fusion"] = model_to_save.fusion.state_dict()
+                if model_to_save.post_lift_lidar is not None:
+                    ckpt_payload["post_lift_lidar"] = (
+                        model_to_save.post_lift_lidar.state_dict()
+                    )
+                    ckpt_payload["post_lift_fuse"] = (
+                        model_to_save.post_lift_fuse.state_dict()
+                    )
+                if model_to_save.memory_fusion is not None:
+                    ckpt_payload["memory_fusion"] = (
+                        model_to_save.memory_fusion.state_dict()
+                    )
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
-                if args.exp in BEVDETOCC_LIDAR_EXPS:
+                if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS):
                     keep_payload = {
                         "model": ckpt_payload["model"],
                         "epoch": epoch,

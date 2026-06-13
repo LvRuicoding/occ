@@ -16,6 +16,11 @@ if [ "$DATASET" = "waymo" ]; then
     python dataset_setup/base_make_seq.py --prefix "$SEQ_PREFIX" $SEQ_ARGS --dataset waymo \
         --camera $CAMERA \
         --seq_mode $SEQ_MODE
+elif [ "$DATASET" = "waymo_tiny" ]; then
+    echo "Making seq for Waymo tiny"
+    python dataset_setup/base_make_seq.py --prefix "$SEQ_PREFIX" $SEQ_ARGS --dataset waymo_tiny \
+        --camera $CAMERA \
+        --seq_mode $SEQ_MODE
 elif [ "$DATASET" = "vkitti" ]; then
     echo "Making seq for Virtual Kitti"
     if [ "$SEQ_MODE" = "surround" ]; then
@@ -47,6 +52,11 @@ elif [ "$DATASET" = "kitti" ]; then
 elif [ "$DATASET" = "once" ]; then
     echo "Making seq for ONCE"
     python dataset_setup/base_make_seq.py --prefix "$SEQ_PREFIX" $SEQ_ARGS --dataset once \
+        --camera $CAMERA \
+        --seq_mode $SEQ_MODE
+elif [ "$DATASET" = "nuscenes" ]; then
+    echo "Making seq for nuScenes"
+    python dataset_setup/base_make_seq.py --prefix "$SEQ_PREFIX" $SEQ_ARGS --dataset nuscenes \
         --camera $CAMERA \
         --seq_mode $SEQ_MODE
 elif [ "$DATASET" = "occ3d_nuscenes" ]; then

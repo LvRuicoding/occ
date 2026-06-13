@@ -222,34 +222,25 @@ def _pointmap_targets_from_depth(
     R = T_ref_from_cam[:, :, :3, :3]
     t = T_ref_from_cam[:, :, :3, 3]
     pts_ref = torch.einsum("bnij,bnhwj->bnhwi", R, pts_local) + t[:, :, None, None, :]
+    valid = valid & torch.isfinite(pts_ref).all(dim=-1)
     return pts_ref, pts_local, valid
 
 
-def _normalize_pair_by_avg_dis(
-    pred_ref: torch.Tensor,
-    pred_local: torch.Tensor,
+def _gt_avg_dis_factor(
     gt_ref: torch.Tensor,
-    gt_local: torch.Tensor,
     valid: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    mask_f = valid.to(dtype=pred_ref.dtype)
-    pred_dis = pred_ref.float().norm(dim=-1)
+) -> torch.Tensor:
+    """OccAny PointmapLoss-style avg_dis factor from GT only."""
     gt_dis = gt_ref.float().norm(dim=-1)
-    dims = tuple(range(1, pred_dis.ndim))
-    pred_factor = (pred_dis * mask_f).sum(dim=dims, keepdim=True) / mask_f.sum(
-        dim=dims, keepdim=True
-    ).clamp(min=1.0)
-    gt_factor = (gt_dis * mask_f).sum(dim=dims, keepdim=True) / mask_f.sum(
-        dim=dims, keepdim=True
-    ).clamp(min=1.0)
-    pred_factor = pred_factor.clamp(min=1e-8).unsqueeze(-1)
-    gt_factor = gt_factor.clamp(min=1e-8).unsqueeze(-1)
-    return (
-        pred_ref / pred_factor.to(dtype=pred_ref.dtype),
-        pred_local / pred_factor.to(dtype=pred_local.dtype),
-        gt_ref / gt_factor.to(dtype=gt_ref.dtype),
-        gt_local / gt_factor.to(dtype=gt_local.dtype),
-    )
+    mask_f = valid.to(dtype=gt_dis.dtype)
+    dims = tuple(range(1, gt_dis.ndim))
+    valid_count = mask_f.sum(dim=dims, keepdim=True).clamp(min=1e-8)
+    norm_factor = (gt_dis * mask_f).sum(dim=dims, keepdim=True) / valid_count
+    return norm_factor.clamp(min=1e-8).unsqueeze(-1)
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return values[mask].mean() if bool(mask.any().item()) else values.new_zeros(())
 
 
 def pointmap_reconstruction_loss(
@@ -264,7 +255,14 @@ def pointmap_reconstruction_loss(
     conf_alpha: float = 0.2,
     gt_scale: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-    """Original OccAny-style pointmap loss on valid depth pixels."""
+    """OccAny-style pointmap loss on valid dense-depth pixels.
+
+    Training mirrors OccAny's confidence-aware pointmap objective:
+    global and local L21 losses are computed separately, confidence-weighted
+    separately, then summed. When gt_scale is False, both predictions and GT
+    are divided by the same per-sample avg_dis factor computed from GT global
+    pointmaps, matching the current PointmapLoss normalization semantics.
+    """
     if pred_pts3d.shape != pred_pts3d_local.shape:
         raise RuntimeError(
             f"pred global/local pointmap shapes differ: {tuple(pred_pts3d.shape)} vs "
@@ -278,6 +276,8 @@ def pointmap_reconstruction_loss(
         pred_ref = pred_pts3d.float()
         pred_local = pred_pts3d_local.float()
         conf = pred_conf.to(device=device, dtype=torch.float32)
+        if conf.ndim == pred_ref.ndim and conf.shape[-1] == 1:
+            conf = conf[..., 0]
         dense_depth = dense_depth.to(device=device, dtype=torch.float32)
         K_per_frame = K_per_frame.to(device=device, dtype=torch.float32)
         cam2world_per_frame = cam2world_per_frame.to(device=device, dtype=torch.float32)
@@ -306,41 +306,54 @@ def pointmap_reconstruction_loss(
                 "pointmap_weighted": 0.0,
                 "pointmap_pts3d": 0.0,
                 "pointmap_pts3d_local": 0.0,
+                "pointmap_conf_loss_g": 0.0,
+                "pointmap_conf_loss_l": 0.0,
                 "pointmap_valid": 0.0,
             }
 
+        norm_factor = None
         if not gt_scale:
-            pred_ref, pred_local, gt_ref, gt_local = _normalize_pair_by_avg_dis(
-                pred_ref,
-                pred_local,
-                gt_ref,
-                gt_local,
-                valid,
-            )
+            norm_factor = _gt_avg_dis_factor(gt_ref, valid)
+            norm_factor = norm_factor.to(device=device, dtype=torch.float32)
+            pred_ref = pred_ref / norm_factor
+            pred_local = pred_local / norm_factor
+            gt_ref = gt_ref / norm_factor
+            gt_local = gt_local / norm_factor
 
         loss_ref = torch.norm(pred_ref - gt_ref, dim=-1)
         loss_local = torch.norm(pred_local - gt_local, dim=-1)
-        conf_safe = conf.clamp(min=1e-6)
         if conf.shape != valid.shape:
             raise RuntimeError(
                 f"pred_conf shape {tuple(conf.shape)} does not match valid mask {tuple(valid.shape)}."
             )
 
-        if gt_scale:
-            loss_raw = (loss_ref[valid].mean() + loss_local[valid].mean())
-        else:
+        loss_ref_mean = _masked_mean(loss_ref, valid)
+        loss_local_mean = _masked_mean(loss_local, valid)
+        use_confidence = (float(conf_alpha) > 0.0) and (not gt_scale)
+        if use_confidence:
+            conf_safe = conf.clamp(min=1e-6)
             conf_loss_ref = loss_ref * conf - float(conf_alpha) * torch.log(conf_safe)
             conf_loss_local = loss_local * conf - float(conf_alpha) * torch.log(conf_safe)
-            loss_raw = conf_loss_ref[valid].mean() + conf_loss_local[valid].mean()
+            loss_ref_out = _masked_mean(conf_loss_ref, valid)
+            loss_local_out = _masked_mean(conf_loss_local, valid)
+        else:
+            loss_ref_out = loss_ref_mean
+            loss_local_out = loss_local_mean
+
+        loss_raw = loss_ref_out + loss_local_out
 
         weighted = float(loss_weight) * loss_raw
         details = {
             "pointmap": float(loss_raw.detach()),
             "pointmap_weighted": float(weighted.detach()),
-            "pointmap_pts3d": float(loss_ref[valid].mean().detach()),
-            "pointmap_pts3d_local": float(loss_local[valid].mean().detach()),
+            "pointmap_pts3d": float(loss_ref_mean.detach()),
+            "pointmap_pts3d_local": float(loss_local_mean.detach()),
+            "pointmap_conf_loss_g": float(loss_ref_out.detach()),
+            "pointmap_conf_loss_l": float(loss_local_out.detach()),
             "pointmap_valid": float(valid_count.detach()),
         }
+        if norm_factor is not None:
+            details["pointmap_norm_factor"] = float(norm_factor.detach().mean())
     return weighted, loss_raw.detach(), details
 
 
