@@ -37,12 +37,21 @@ def get_accuracy(predict, target, weight=None):  # 0.05s
 
 
 class SSCMetrics:
-    def __init__(self, n_classes, class_names, other_class, ignore_other_class_in_mIoU, empty_class=0):
+    def __init__(
+        self,
+        n_classes,
+        class_names,
+        other_class,
+        ignore_other_class_in_mIoU,
+        empty_class=0,
+        valid_classes=None,
+    ):
         self.n_classes = n_classes
         self.class_names = class_names
         self.other_class = other_class
         self.ignore_other_class_in_mIoU = ignore_other_class_in_mIoU
         self.empty_class = empty_class
+        self.valid_classes = None if valid_classes is None else list(valid_classes)
         self.reset()
 
     def hist_info(self, n_cl, pred, gt):
@@ -108,14 +117,16 @@ class SSCMetrics:
         recall_per_class = self.tps / (self.tps + self.fns + 1e-5)
         iou_per_class = self.tps / (self.tps + self.fps + self.fns + 1e-5)
         
-        if self.ignore_other_class_in_mIoU:
+        if self.valid_classes is not None:
+            valid_classes = list(self.valid_classes)
+        elif self.ignore_other_class_in_mIoU:
             valid_classes = [i for i in range(len(iou_per_class)) if i != self.empty_class and i != self.other_class]
         else: 
             valid_classes = [i for i in range(len(iou_per_class)) if i != self.empty_class]
             
         iou_per_class = [iou_per_class[i] for i in valid_classes]
         class_names = [self.class_names[i] for i in valid_classes]
-        mIoU = np.mean(iou_per_class)
+        mIoU = np.mean(iou_per_class) if len(iou_per_class) > 0 else 0.0
 
         return {
             "precision": precision,
@@ -197,11 +208,11 @@ class SSCMetrics:
         target = target.reshape(_bs, -1)  # (_bs, 129600)
         predict = predict.reshape(_bs, -1)  # (_bs, 129600), 60*36*60=129600
 
-        cnt_class = np.zeros(_C, dtype=np.int32)  # count for each class
+        cnt_class = np.zeros(_C, dtype=np.int64)  # count for each class
         iou_sum = np.zeros(_C, dtype=np.float32)  # sum of iou for each class
-        tp_sum = np.zeros(_C, dtype=np.int32)  # tp
-        fp_sum = np.zeros(_C, dtype=np.int32)  # fp
-        fn_sum = np.zeros(_C, dtype=np.int32)  # fn
+        tp_sum = np.zeros(_C, dtype=np.int64)  # tp
+        fp_sum = np.zeros(_C, dtype=np.int64)  # fp
+        fn_sum = np.zeros(_C, dtype=np.int64)  # fn
 
         for idx in range(_bs):
             y_true = target[idx, :]  # GT

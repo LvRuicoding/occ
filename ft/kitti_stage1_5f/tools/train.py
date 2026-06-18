@@ -4,8 +4,6 @@ Example:
   torchrun --standalone --nnodes=1 --nproc_per_node=4 \
       -m ft.kitti_stage1_5f.tools.train \
       --processed_root /home/dataset-local/lr/code/OccAny/data/kitti_processed \
-      --kittiodo_root /home/dataset-local/lr/code/OccAny/raw_data/semantickitti \
-      --velodyne_root /home/dataset-local/lr/code/OccAny/data/kitti \
       --occany_ckpt /home/dataset-local/lr/code/OccAny/checkpoints/occany_recon.pth \
       --output_dir /home/dataset-local/lr/code/OccAny/output/kitti_stage1_5f_4gpu_monoscene_lidar_selfattn \
       --exp monoscene_lidar \
@@ -34,7 +32,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 import dust3r.utils.path_to_croco  # noqa: F401
@@ -50,19 +48,23 @@ from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
 from ft.semantickitti_ft.losses import SSCLoss
 from ..datasets import (
     KITTI_SSC_CLASS_NAMES,
+    UNIFIED_SSC_CLASS_NAMES,
     Kitti5FrameStage1DenseDepthDataset,
     Kitti5FrameStage1Dataset,
     Kitti5FrameStage1LidarDenseDepthDataset,
     Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoDataset,
     Kitti5FrameStage1MonoLidarDataset,
+    NuScenes5FrameStage1LidarDataset,
     collate_stage1,
     collate_stage1_dense_depth,
     collate_stage1_lidar_dense_depth,
     collate_stage1_lidar,
     collate_stage1_mono,
     collate_stage1_mono_lidar,
+    collate_stage1_nuscenes_lidar,
 )
+from ..datasets.unified_occ import NUSCENES_TO_UNIFIED
 from ..losses_monoscene import MonoSceneSSCLoss
 from ..models import (
     Stage1SSCBEVDetOccLidarDenseDepthModel,
@@ -184,10 +186,10 @@ def get_args_parser() -> argparse.ArgumentParser:
     #                         block applied to OccAny's reconstruction tokens
     #                         (post-decoder, pre-lifting). The OccAny backbone
     #                         stays fully frozen; only fusion/lifting/head train.
-    #                         Requires --velodyne_root.
+    #                         Reads LiDAR from processed_root.
     #   - "bevdetocc_lidar": keep the first 2D LiDAR/image cross-attention,
     #                         then use LSS + LiDAR memory + NATTEN + BEVDet-OCC
-    #                         3D encoder/head. Requires --velodyne_root.
+    #                         3D encoder/head. Reads LiDAR from processed_root.
     #   - "bevdetocc_lidar_dense_depth": same as bevdetocc_lidar plus a
     #                         post-2D-fusion DPT-style dense depth head.
     #   - "bevdetocc_lidar_pointmap": same as bevdetocc_lidar plus a cloned
@@ -213,8 +215,33 @@ def get_args_parser() -> argparse.ArgumentParser:
     )
     # LiDAR-fusion-only options.
     p.add_argument("--velodyne_root", default=None, type=str,
-                   help="Raw KITTI Odometry root: <velodyne_root>/sequences/<seq>/velodyne/*.bin. "
-                        "Required for LiDAR experiments.")
+                   help="Deprecated compatibility option; KITTI LiDAR is read from "
+                        "<processed_root>/<split>_<seq>/lidar/*.bin.")
+    p.add_argument("--nuscenes_processed_root", default=None, type=str,
+                   help="Path to data/nuscenes_processed for KITTI+nuScenes multi-dataset training.")
+    p.add_argument("--nuscenes_raw_root", default=None, type=str,
+                   help="Deprecated compatibility option; nuScenes calibration/pose is read from "
+                        "<nuscenes_processed_root>/<split>_scene-*/meta/*.npz.")
+    p.add_argument("--multi_dataset", action="store_true",
+                   help="Train BEVDet-OCC LiDAR with KITTI and Occ3D-nuScenes using shared weights.")
+    p.add_argument("--dataset_ratio", type=str, default="1:1",
+                   help="KITTI:nuScenes sampling ratio for --multi_dataset. Default: 1:1.")
+    p.add_argument("--nuscenes_frame_stride", type=int, default=1,
+                   help="Temporal stride for nuScenes samples under --multi_dataset.")
+    p.add_argument("--iters_per_epoch", type=int, default=0,
+                   help="If >0, cap/define training iterations per epoch.")
+    p.add_argument("--val_iters", type=int, default=0,
+                   help="If >0, cap validation iterations under --multi_dataset.")
+    p.add_argument("--init_from", default=None, type=str,
+                   help="Warm-start model weights from a checkpoint without restoring optimizer/epoch.")
+    p.add_argument("--head_lr", type=float, default=1e-4,
+                   help="LR for BEV/SSC head modules when using grouped optimizer.")
+    p.add_argument("--classifier_lr", type=float, default=2e-4,
+                   help="LR for final classifier when using grouped optimizer.")
+    p.add_argument("--base_lr", type=float, default=5e-5,
+                   help="LR for already-initialized non-head modules under --multi_dataset.")
+    p.add_argument("--class_weights_path", default=None, type=str,
+                   help="Optional JSON/list/tensor path for unified 27-class loss weights.")
     p.add_argument("--max_points_per_sweep", type=int, default=0,
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
     p.add_argument("--depth_supervision", action=argparse.BooleanOptionalAction, default=True,
@@ -282,7 +309,72 @@ def get_args_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
+class BalancedMultiDataset(Dataset):
+    """Deterministic wrapper over KITTI and nuScenes datasets."""
+
+    def __init__(
+        self,
+        kitti: Dataset,
+        nuscenes: Dataset,
+        *,
+        kitti_weight: int = 1,
+        nuscenes_weight: int = 1,
+        length: int | None = None,
+        train: bool = True,
+    ) -> None:
+        self.kitti = kitti
+        self.nuscenes = nuscenes
+        self.pattern = ["kitti"] * int(kitti_weight) + ["nuscenes"] * int(nuscenes_weight)
+        if not self.pattern:
+            raise ValueError("dataset ratio must include at least one dataset.")
+        self.all_frames = length is None or length <= 0
+        base = len(kitti) + len(nuscenes) if self.all_frames else int(length)
+        self._length = base
+        self.train = bool(train)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int):
+        if self.all_frames:
+            if index < len(self.kitti):
+                return self.kitti[index]
+            return self.nuscenes[index - len(self.kitti)]
+
+        dataset_name = self.pattern[index % len(self.pattern)]
+        cycle = index // len(self.pattern)
+        if dataset_name == "kitti":
+            return self.kitti[cycle % len(self.kitti)]
+        return self.nuscenes[cycle % len(self.nuscenes)]
+
+
+class FixedLengthDataset(Dataset):
+    """Repeat one dataset to a fixed number of iterations per epoch."""
+
+    def __init__(self, dataset: Dataset, length: int | None = None) -> None:
+        self.dataset = dataset
+        self._length = int(length) if length is not None and length > 0 else len(dataset)
+        if len(dataset) <= 0:
+            raise ValueError("FixedLengthDataset requires a non-empty dataset.")
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int):
+        return self.dataset[index % len(self.dataset)]
+
+
+def _parse_dataset_ratio(value: str) -> tuple[int, int]:
+    parts = str(value).split(":")
+    if len(parts) != 2:
+        raise ValueError("--dataset_ratio must have form KITTI:NUSCENES, e.g. 1:1")
+    a, b = int(parts[0]), int(parts[1])
+    if a < 0 or b < 0 or a + b <= 0:
+        raise ValueError("--dataset_ratio values must be non-negative and not both zero.")
+    return a, b
+
+
+def _build_kitti_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
     common = dict(
         processed_root=args.processed_root,
         split=split,
@@ -292,8 +384,6 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
         cam_idx=0,
     )
     if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
-        if not args.velodyne_root:
-            raise ValueError(f"--velodyne_root is required when --exp={args.exp}")
         return Kitti5FrameStage1LidarDenseDepthDataset(
             velodyne_root=args.velodyne_root,
             max_points_per_sweep=args.max_points_per_sweep,
@@ -302,16 +392,12 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
     if args.exp in POINTMAP_DENSE_DEPTH_DATA_EXPS:
         return Kitti5FrameStage1DenseDepthDataset(**common)
     if args.exp == "bevdetocc_lidar":
-        if not args.velodyne_root:
-            raise ValueError("--velodyne_root is required when --exp=bevdetocc_lidar")
         return Kitti5FrameStage1LidarDataset(
             velodyne_root=args.velodyne_root,
             max_points_per_sweep=args.max_points_per_sweep,
             **common,
         )
     if args.exp == "monoscene_lidar":
-        if not args.velodyne_root:
-            raise ValueError("--velodyne_root is required when --exp=monoscene_lidar")
         return Kitti5FrameStage1MonoLidarDataset(
             velodyne_root=args.velodyne_root,
             max_points_per_sweep=args.max_points_per_sweep,
@@ -322,7 +408,117 @@ def _build_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
     return Kitti5FrameStage1Dataset(**common)
 
 
+def _build_nuscenes_dataset(args, split: str) -> NuScenes5FrameStage1LidarDataset:
+    if not args.nuscenes_processed_root:
+        raise ValueError("--nuscenes_processed_root is required for nuScenes training/eval.")
+    return NuScenes5FrameStage1LidarDataset(
+        processed_root=args.nuscenes_processed_root,
+        split=split,
+        num_frames=args.num_frames,
+        frame_stride=args.nuscenes_frame_stride,
+        output_resolution=(args.width, args.height),
+        max_points_per_sweep=args.max_points_per_sweep,
+    )
+
+
+def _limit_dataset(dataset: Dataset, length: int) -> Dataset:
+    length = int(length)
+    if length <= 0 or len(dataset) <= length:
+        return dataset
+    return Subset(dataset, range(length))
+
+
+def _build_dataset(args, split: str) -> Dataset:
+    if not bool(getattr(args, "multi_dataset", False)):
+        return _build_kitti_dataset(args, split)
+
+    if args.exp != "bevdetocc_lidar":
+        raise ValueError("--multi_dataset currently supports --exp=bevdetocc_lidar only.")
+    if int(args.batch_size) != 1:
+        raise ValueError("--multi_dataset requires --batch_size=1 because grid shapes differ.")
+
+    kitti_weight, nuscenes_weight = _parse_dataset_ratio(args.dataset_ratio)
+    if kitti_weight == 0:
+        nuscenes = _build_nuscenes_dataset(args, split)
+        length = (
+            int(args.iters_per_epoch)
+            if split == "train" and int(args.iters_per_epoch) > 0
+            else None
+        )
+        return FixedLengthDataset(nuscenes, length=length)
+    if nuscenes_weight == 0:
+        kitti = _build_kitti_dataset(args, split)
+        length = (
+            int(args.iters_per_epoch)
+            if split == "train" and int(args.iters_per_epoch) > 0
+            else None
+        )
+        return FixedLengthDataset(kitti, length=length)
+
+    kitti = _build_kitti_dataset(args, split)
+    nuscenes = _build_nuscenes_dataset(args, split)
+    if split != "train":
+        val_length = int(args.val_iters) if int(args.val_iters) > 0 else None
+        return BalancedMultiDataset(
+            kitti,
+            nuscenes,
+            kitti_weight=kitti_weight,
+            nuscenes_weight=nuscenes_weight,
+            length=val_length,
+            train=False,
+        )
+
+    train_length = int(args.iters_per_epoch) if int(args.iters_per_epoch) > 0 else None
+    return BalancedMultiDataset(
+        kitti,
+        nuscenes,
+        kitti_weight=kitti_weight,
+        nuscenes_weight=nuscenes_weight,
+        length=train_length,
+        train=True,
+    )
+
+
+def _eval_valid_classes(dataset_name: str, args) -> List[int] | None:
+    if not bool(getattr(args, "multi_dataset", False)):
+        return None
+    if dataset_name == "kitti":
+        return list(range(1, len(KITTI_SSC_CLASS_NAMES)))
+    if dataset_name == "nuscenes":
+        return sorted({int(v) for v in NUSCENES_TO_UNIFIED.tolist() if int(v) != 0})
+    return None
+
+
+def _build_eval_loaders(args) -> Dict[str, DataLoader]:
+    if not bool(getattr(args, "multi_dataset", False)):
+        dataset = _build_dataset(args, "val")
+        return {"kitti": _build_loader(args, dataset, train=False)}
+
+    val_limit = int(args.val_iters) if int(args.val_iters) > 0 else 0
+    kitti_weight, nuscenes_weight = _parse_dataset_ratio(args.dataset_ratio)
+    datasets = {}
+    if kitti_weight > 0:
+        datasets["kitti"] = _build_kitti_dataset(args, "val")
+    if nuscenes_weight > 0:
+        datasets["nuscenes"] = _build_nuscenes_dataset(args, "val")
+    return {
+        name: _build_loader(args, _limit_dataset(dataset, val_limit), train=False)
+        for name, dataset in datasets.items()
+    }
+
+
 def _collate_fn(args):
+    if bool(getattr(args, "multi_dataset", False)):
+        def _collate_multi(batch):
+            names = [b.get("dataset_name", "kitti") for b in batch]
+            if any(n != names[0] for n in names):
+                raise RuntimeError(
+                    "Mixed dataset batch contains multiple grid shapes; use --batch_size=1."
+                )
+            if names[0] == "nuscenes":
+                return collate_stage1_nuscenes_lidar(batch)
+            return collate_stage1_lidar(batch)
+        return _collate_multi
     if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
         return collate_stage1_lidar_dense_depth
     if args.exp in POINTMAP_DENSE_DEPTH_DATA_EXPS:
@@ -343,7 +539,7 @@ def _build_loader(args, dataset: Kitti5FrameStage1Dataset, train: bool) -> DataL
             num_replicas=misc.get_world_size(),
             rank=misc.get_rank(),
             shuffle=train,
-            drop_last=train,
+            drop_last=False,
         )
     else:
         sampler = (
@@ -357,7 +553,7 @@ def _build_loader(args, dataset: Kitti5FrameStage1Dataset, train: bool) -> DataL
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=train,
+        drop_last=False,
         collate_fn=_collate_fn(args),
     )
 
@@ -379,13 +575,117 @@ def _filter_state_dict_without_backbone(
     return {
         k: v
         for k, v in state_dict.items()
-        if not k.startswith("backbone.") or _is_backbone_pointmap_head_key(k)
+        if not k.removeprefix("module.").startswith("backbone.")
+        or _is_backbone_pointmap_head_key(k.removeprefix("module."))
     }
 
 
 def _state_dict_without_backbone(model: nn.Module) -> Dict[str, torch.Tensor]:
     """Checkpoint only trainable/non-frozen modules when OccAny is frozen."""
     return _filter_state_dict_without_backbone(model.state_dict())
+
+
+def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if not any(k.startswith("module.") for k in state_dict):
+        return state_dict
+    return {k.removeprefix("module."): v for k, v in state_dict.items()}
+
+
+def _expand_20_to_27_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Expand BEVDet classifier rows from KITTI-20 to unified-27 when present."""
+    out = dict(state_dict)
+    semantic_sources = {
+        20: 5,   # other <- other-vehicle
+        21: 14,  # barrier <- fence
+        22: 5,   # bus <- other-vehicle
+        23: 5,   # construction-vehicle <- other-vehicle
+        24: 19,  # traffic-cone <- traffic-sign
+        25: 5,   # trailer <- other-vehicle
+        26: 13,  # manmade <- building
+    }
+    for weight_key in ("occ_head.predicter.2.weight", "module.occ_head.predicter.2.weight"):
+        bias_key = weight_key.replace("weight", "bias")
+        if weight_key not in out:
+            continue
+        w = out[weight_key]
+        if not (isinstance(w, torch.Tensor) and w.ndim == 2 and w.shape[0] == 20):
+            continue
+        new_w = w.new_empty((27, w.shape[1]))
+        new_w[:20].copy_(w)
+        for dst, src in semantic_sources.items():
+            new_w[dst].copy_(w[src])
+        new_w[20:].add_(torch.randn_like(new_w[20:]) * 1e-3)
+        out[weight_key] = new_w
+        if bias_key in out and isinstance(out[bias_key], torch.Tensor) and out[bias_key].shape[0] == 20:
+            b = out[bias_key]
+            new_b = b.new_empty((27,))
+            new_b[:20].copy_(b)
+            for dst, src in semantic_sources.items():
+                new_b[dst].copy_(b[src])
+            new_b[20:].add_(torch.randn_like(new_b[20:]) * 1e-3)
+            out[bias_key] = new_b
+    return out
+
+
+def _load_class_weights(args) -> torch.Tensor:
+    if args.class_weights_path:
+        path = Path(args.class_weights_path)
+        if path.suffix.lower() == ".json":
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                values = [float(data[name]) for name in UNIFIED_SSC_CLASS_NAMES]
+            else:
+                values = [float(v) for v in data]
+            weights = torch.tensor(values, dtype=torch.float32)
+        else:
+            weights = torch.as_tensor(torch.load(path, map_location="cpu"), dtype=torch.float32)
+        if weights.numel() != len(UNIFIED_SSC_CLASS_NAMES):
+            raise ValueError(
+                f"class weights must have {len(UNIFIED_SSC_CLASS_NAMES)} values, got {weights.numel()}"
+            )
+        return weights.view(-1).clamp(0.25, 5.0)
+
+    return torch.ones(len(UNIFIED_SSC_CLASS_NAMES), dtype=torch.float32)
+
+
+def _load_init_from(model: nn.Module, ckpt_path: str) -> None:
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "model" in ckpt:
+        state = ckpt["model"]
+    else:
+        state = {
+            **{f"lifting.{k}": v for k, v in ckpt.get("lifting", {}).items()},
+            **{f"occ_head.{k}": v for k, v in ckpt.get("occ_head", {}).items()},
+        }
+        if "fusion" in ckpt:
+            state.update({f"fusion.{k}": v for k, v in ckpt["fusion"].items()})
+    model_state = model.state_dict()
+    state = _strip_module_prefix(_filter_state_dict_without_backbone(state))
+    wants_unified_head = any(
+        k.endswith("occ_head.predicter.2.weight")
+        and isinstance(v, torch.Tensor)
+        and v.ndim >= 1
+        and v.shape[0] == len(UNIFIED_SSC_CLASS_NAMES)
+        for k, v in model_state.items()
+    )
+    if wants_unified_head:
+        state = _expand_20_to_27_state_dict(state)
+    compatible = {
+        k: v
+        for k, v in state.items()
+        if k in model_state and isinstance(v, torch.Tensor) and tuple(v.shape) == tuple(model_state[k].shape)
+    }
+    missing_shape = [
+        k for k, v in state.items()
+        if k in model_state and isinstance(v, torch.Tensor) and tuple(v.shape) != tuple(model_state[k].shape)
+    ]
+    status = model.load_state_dict(compatible, strict=False)
+    print(
+        f"[init_from] loaded {len(compatible)} tensors from {ckpt_path}; "
+        f"skipped_shape={len(missing_shape)} missing={len(status.missing_keys)} "
+        f"unexpected={len(status.unexpected_keys)}"
+    )
 
 
 def _trainable_param_count(model: nn.Module) -> int:
@@ -458,9 +758,37 @@ def _apply_backbone_freeze_state(model: nn.Module, args, epoch: int) -> bool:
 
 
 def _make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer | None:
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    named_trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    trainable_params = [p for _, p in named_trainable]
     if not trainable_params:
         return None
+    if bool(getattr(args, "multi_dataset", False)):
+        base_params = []
+        head_params = []
+        classifier_params = []
+        for name, param in named_trainable:
+            clean = name.removeprefix("module.")
+            if clean.startswith("occ_head.predicter.2."):
+                classifier_params.append(param)
+            elif clean.startswith("occ_head."):
+                head_params.append(param)
+            else:
+                base_params.append(param)
+        groups = []
+        if base_params:
+            groups.append({"params": base_params, "lr": float(args.base_lr), "lr_scale": 1.0})
+        if head_params:
+            groups.append({"params": head_params, "lr": float(args.head_lr), "lr_scale": 1.0})
+        if classifier_params:
+            groups.append(
+                {"params": classifier_params, "lr": float(args.classifier_lr), "lr_scale": 1.0}
+            )
+        return torch.optim.AdamW(
+            groups,
+            lr=float(args.base_lr),
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95),
+        )
     return torch.optim.AdamW(
         trainable_params,
         lr=args.lr,
@@ -540,6 +868,21 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     """Dispatch the model forward to match each experiment's signature."""
     views = _move_views_to_device(batch["views"], device)
     T_target_from_refcam = batch["T_target_from_refcam"].to(device, non_blocking=True)
+    grid_config = {
+        key: batch[key].to(device, non_blocking=True)
+        for key in (
+            "grid_size",
+            "voxel_origin",
+            "voxel_size",
+            "half_grid_size",
+            "half_voxel_origin",
+            "half_voxel_size",
+            "fusion_vox_origin",
+            "fusion_vox_size",
+            "fusion_vox_grid",
+        )
+        if key in batch and isinstance(batch[key], torch.Tensor)
+    }
     if args.exp == "pointmap_postfusion_only":
         return model(
             views,
@@ -560,6 +903,7 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             batch["K_per_frame"].to(device, non_blocking=True),
             batch["image_hw"].to(device, non_blocking=True),
             return_depth=bool(getattr(args, "depth_supervision", False)),
+            grid_config=grid_config,
         )
     if args.exp == "monoscene_lidar":
         return model(
@@ -871,6 +1215,22 @@ def _float_list(values) -> List[float]:
     return [float(v) for v in values]
 
 
+def _jsonable_metric_value(value):
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, np.ndarray):
+        return _jsonable_metric_value(value.tolist())
+    if isinstance(value, torch.Tensor):
+        return _jsonable_metric_value(value.detach().cpu().tolist())
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_metric_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable_metric_value(v) for k, v in value.items()}
+    return None
+
+
 def _gather_pointmap_metric_states(local_state: Dict, args) -> List[Dict] | None:
     if not getattr(args, "distributed", False):
         return [local_state]
@@ -894,8 +1254,9 @@ def _build_log_stats(epoch: int, train_stats: Dict, val_stats: Dict) -> Dict:
         **{f"train_{k}": v for k, v in train_stats.items()},
     )
     for k, v in val_stats.items():
-        if isinstance(v, (int, float, np.integer, np.floating)):
-            log_stats[f"val_{k}"] = float(v)
+        converted = _jsonable_metric_value(v)
+        if converted is not None:
+            log_stats[f"val_{k}"] = converted
 
     if "class_names" in val_stats and "iou_per_class" in val_stats:
         per_class_iou = _per_class_iou_dict(val_stats)
@@ -908,14 +1269,30 @@ def _build_log_stats(epoch: int, train_stats: Dict, val_stats: Dict) -> Dict:
     return log_stats
 
 
+def _flatten_eval_stats(eval_stats: Dict[str, Dict]) -> Dict:
+    flat: Dict = {}
+    for dataset_name, stats in eval_stats.items():
+        prefix = f"{dataset_name}_"
+        for key, value in stats.items():
+            flat[f"{prefix}{key}"] = value
+        for class_name, iou in _per_class_iou_dict(stats).items():
+            flat[f"{prefix}iou_class_{_sanitize_metric_key(class_name)}"] = float(iou)
+    return flat
+
+
 def _adjust_lr(optimizer, epoch_f: float, args) -> float:
+    base_lr = float(getattr(args, "base_lr", args.lr)) if bool(getattr(args, "multi_dataset", False)) else float(args.lr)
     if epoch_f < args.warmup_epochs:
-        lr = args.lr * epoch_f / max(args.warmup_epochs, 1)
+        lr = base_lr * epoch_f / max(args.warmup_epochs, 1)
     else:
         progress = (epoch_f - args.warmup_epochs) / max(args.epochs - args.warmup_epochs, 1)
-        lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * progress))
+        lr = args.min_lr + 0.5 * (base_lr - args.min_lr) * (1 + math.cos(math.pi * progress))
     for pg in optimizer.param_groups:
-        pg["lr"] = lr * pg.get("lr_scale", 1.0)
+        initial = float(pg.get("initial_lr", pg.get("lr", lr)))
+        if "initial_lr" not in pg:
+            pg["initial_lr"] = initial
+        scale = initial / max(base_lr, 1e-12)
+        pg["lr"] = lr * scale * pg.get("lr_scale", 1.0)
     return lr
 
 
@@ -1015,17 +1392,24 @@ def eval_one_epoch(
     epoch: int,
     args,
     log_writer,
+    dataset_name: str = "val",
 ):
     model.eval()
     eval_ssc = args.exp not in POINTMAP_ONLY_EXPS
     ssc = None
     if eval_ssc:
+        metric_names = (
+            list(UNIFIED_SSC_CLASS_NAMES)
+            if bool(getattr(args, "multi_dataset", False))
+            else list(KITTI_SSC_CLASS_NAMES)
+        )
         ssc = SSCMetrics(
-            n_classes=20,
-            class_names=list(KITTI_SSC_CLASS_NAMES),
+            n_classes=len(metric_names),
+            class_names=metric_names,
             other_class=None,
             ignore_other_class_in_mIoU=False,
             empty_class=0,
+            valid_classes=_eval_valid_classes(dataset_name, args),
         )
     pointmap_accum = PointmapMetricAccumulator(args) if args.exp in POINTMAP_QUALITY_EXPS else None
     losses_total = 0.0
@@ -1123,22 +1507,23 @@ def eval_one_epoch(
     detail_avgs = {k: v / max(n_batches, 1) for k, v in details_total.items()}
     if log_writer is not None:
         it = 1000 * epoch
-        log_writer.add_scalar("val/loss", loss_avg, it)
+        tb_prefix = "val" if dataset_name == "val" else f"val/{dataset_name}"
+        log_writer.add_scalar(f"{tb_prefix}/loss", loss_avg, it)
         for k, v in detail_avgs.items():
-            log_writer.add_scalar(f"val/{k}", v, it)
+            log_writer.add_scalar(f"{tb_prefix}/{k}", v, it)
         if eval_ssc:
-            log_writer.add_scalar("val/iou", stats["iou"], it)
-            log_writer.add_scalar("val/mIoU", stats["mIoU"], it)
-            log_writer.add_scalar("val/precision", stats["precision"], it)
-            log_writer.add_scalar("val/recall", stats["recall"], it)
+            log_writer.add_scalar(f"{tb_prefix}/iou", stats["iou"], it)
+            log_writer.add_scalar(f"{tb_prefix}/mIoU", stats["mIoU"], it)
+            log_writer.add_scalar(f"{tb_prefix}/precision", stats["precision"], it)
+            log_writer.add_scalar(f"{tb_prefix}/recall", stats["recall"], it)
             for class_name, iou in _per_class_iou_dict(stats).items():
-                log_writer.add_scalar(f"val/iou_class/{class_name}", iou, it)
+                log_writer.add_scalar(f"{tb_prefix}/iou_class/{class_name}", iou, it)
         for k, v in stats.items():
             if k.startswith("pointmap_quality_") and isinstance(v, (int, float)):
-                log_writer.add_scalar(f"val/{k}", v, it)
+                log_writer.add_scalar(f"{tb_prefix}/{k}", v, it)
     if eval_ssc:
         print(
-            f"Val [{epoch}] loss={loss_avg:.4f} IoU={stats['iou']*100:.2f} "
+            f"Val {dataset_name} [{epoch}] loss={loss_avg:.4f} IoU={stats['iou']*100:.2f} "
             f"mIoU={stats['mIoU']*100:.2f} P={stats['precision']*100:.2f} "
             f"R={stats['recall']*100:.2f}"
         )
@@ -1147,7 +1532,7 @@ def eval_one_epoch(
         pm_depth = stats.get("pointmap_quality_depth_absrel", float("nan"))
         pm_chamfer = stats.get("pointmap_quality_chamfer_distance", float("nan"))
         print(
-            f"Val [{epoch}] loss={loss_avg:.4f} "
+            f"Val {dataset_name} [{epoch}] loss={loss_avg:.4f} "
             f"pointmap_l2={pm_l2:.4f} depth_absrel={pm_depth:.4f} "
             f"chamfer={pm_chamfer:.4f}"
         )
@@ -1206,7 +1591,7 @@ def main():
     model_kwargs = dict(
         occany_ckpt=args.occany_ckpt,
         c_lift=args.c_lift,
-        num_classes=20,
+        num_classes=(len(UNIFIED_SSC_CLASS_NAMES) if bool(getattr(args, "multi_dataset", False)) else 20),
         patch_size=args.patch_size,
         token_dim=args.token_dim,
         backbone_img_size=(args.height, args.width),
@@ -1306,6 +1691,9 @@ def main():
     if backbone_hash is not None:
         print(f"Backbone state_dict hash: {backbone_hash}")
 
+    if args.init_from:
+        _load_init_from(model, args.init_from)
+
     # Convert BN -> SyncBN before DDP wrap. At per-GPU bs=1 the MonoScene
     # head's BatchNorm3d layers see one-sample stats per forward, which both
     # makes training trivially fit the single sample and accumulates noisy
@@ -1342,14 +1730,18 @@ def main():
     loss_scaler = NativeScaler(enabled=(args.amp == "fp16"))
     if args.exp in MONOSCENE_LOSS_EXPS:
         criterion = MonoSceneSSCLoss().to(device)
+    elif bool(getattr(args, "multi_dataset", False)):
+        criterion = SSCLoss(class_weights=_load_class_weights(args)).to(device)
     else:
         criterion = SSCLoss().to(device)
 
     train_dataset = _build_dataset(args, "train")
-    val_dataset = _build_dataset(args, "val")
-    print(f"Train samples: {len(train_dataset)}; Val samples: {len(val_dataset)}")
+    eval_loaders = _build_eval_loaders(args)
+    eval_sample_summary = ", ".join(
+        f"{name}={len(loader.dataset)}" for name, loader in eval_loaders.items()
+    )
+    print(f"Train samples: {len(train_dataset)}; Val samples: {eval_sample_summary}")
     train_loader = _build_loader(args, train_dataset, train=True)
-    val_loader = _build_loader(args, val_dataset, train=False)
 
     start_epoch = 0
     optimizer_state_to_load = None
@@ -1443,7 +1835,17 @@ def main():
 
     if args.eval_only:
         _apply_backbone_freeze_state(model_to_save, args, start_epoch)
-        eval_one_epoch(model, val_loader, criterion, device, start_epoch, args, log_writer)
+        for eval_name, eval_loader in eval_loaders.items():
+            eval_one_epoch(
+                model,
+                eval_loader,
+                criterion,
+                device,
+                start_epoch,
+                args,
+                log_writer,
+                dataset_name=eval_name,
+            )
         return
 
     print(f"Start training: epochs={args.epochs}, start_epoch={start_epoch}")
@@ -1467,11 +1869,19 @@ def main():
             model, train_loader, optimizer, loss_scaler, criterion, device, epoch, args, log_writer
         )
 
-        val_stats: Dict[str, float] = {}
+        val_stats: Dict[str, Dict] = {}
         if (epoch + 1) % args.eval_freq == 0:
-            val_stats = eval_one_epoch(
-                model, val_loader, criterion, device, epoch, args, log_writer
-            )
+            for eval_name, eval_loader in eval_loaders.items():
+                val_stats[eval_name] = eval_one_epoch(
+                    model,
+                    eval_loader,
+                    criterion,
+                    device,
+                    epoch,
+                    args,
+                    log_writer,
+                    dataset_name=eval_name,
+                )
 
         if misc.is_main_process():
             if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS):
@@ -1539,7 +1949,16 @@ def main():
                     os.path.join(args.output_dir, f"checkpoint-{epoch}.pth"),
                 )
             with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
-                f.write(json.dumps(_build_log_stats(epoch, train_stats, val_stats)) + "\n")
+                f.write(
+                    json.dumps(
+                        _build_log_stats(
+                            epoch,
+                            train_stats,
+                            _flatten_eval_stats(val_stats),
+                        )
+                    )
+                    + "\n"
+                )
 
     dt = str(datetime.timedelta(seconds=int(time.time() - t0)))
     print(f"Done. Total time: {dt}")

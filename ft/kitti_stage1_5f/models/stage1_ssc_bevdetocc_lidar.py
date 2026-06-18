@@ -8,7 +8,7 @@ decoder tokens, then replaces the old lifting + MonoScene head with:
   temporal warp/concat -> BEVDet CustomResNet3D + LSSFPN3D ->
   full-grid upsample -> final_conv + predicter.
 
-The returned layout always contains ``{"ssc_logit": (B, 20, X, Y, Z)}``.
+The returned layout always contains ``{"ssc_logit": (B, num_classes, X, Y, Z)}``.
 Training can also request BEVDet-style sparse LiDAR depth supervision targets
 for the LSS depth distribution branch.
 """
@@ -116,6 +116,10 @@ class LSSDepthLift(nn.Module):
 
         K = K_per_frame.to(device=device, dtype=torch.float32)
         T = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T.ndim == 3:
+            T = T[:, None].expand(B, N, 4, 4)
+        elif T.ndim != 4:
+            raise RuntimeError(f"T_cam_from_velo must be (B,4,4) or (B,N,4,4), got {tuple(T.shape)}")
         image_hw = image_hw.to(device=device, dtype=torch.float32)
 
         with torch.amp.autocast(device_type=device.type, enabled=False):
@@ -124,9 +128,9 @@ class LSSDepthLift(nn.Module):
                 img_w = image_hw[b, 1].clamp(min=1.0)
                 scale_x = img_w / float(W_t)
                 scale_y = img_h / float(H_t)
-                R = T[b, :3, :3]
-                t = T[b, :3, 3]
                 for f in range(N):
+                    R = T[b, f, :3, :3]
+                    t = T[b, f, :3, 3]
                     pts = points_per_frame[b][f]
                     if pts.numel() == 0:
                         continue
@@ -199,9 +203,13 @@ class LSSDepthLift(nn.Module):
         W_t: int,
         image_hw: torch.Tensor,
         device: torch.device,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         D = self.depth_channels
-        Gx, Gy, Gz = self.grid_size
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        Gx, Gy, Gz = grid
 
         u, v = self._pixel_centers(H_t, W_t, image_hw, device=device)
         depths = self.depth_values.to(device=device, dtype=torch.float32).view(D, 1, 1)
@@ -222,8 +230,16 @@ class LSSDepthLift(nn.Module):
         p_velo = p_cam.reshape(-1, 3) @ R.T + t
         p_velo = p_velo.view(D, H_t, W_t, 3)
 
-        origin = self.voxel_origin.to(device=device, dtype=torch.float32)
-        size = self.voxel_size.to(device=device, dtype=torch.float32)
+        origin = (
+            self.voxel_origin
+            if voxel_origin is None
+            else voxel_origin
+        ).to(device=device, dtype=torch.float32)
+        size = (
+            self.voxel_size
+            if voxel_size is None
+            else voxel_size
+        ).to(device=device, dtype=torch.float32)
         idx = torch.floor((p_velo - origin) / size).long()
         valid = (
             torch.isfinite(p_velo).all(dim=-1)
@@ -248,11 +264,15 @@ class LSSDepthLift(nn.Module):
         T_cam_from_velo: torch.Tensor,  # (B, 4, 4)
         image_hw: torch.Tensor,      # (B, 2)
         gt_depth: Optional[torch.Tensor] = None,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del gt_depth  # Depth supervision is computed outside the lift operator.
 
         B, N, C, H_t, W_t = feat_2d.shape
-        Gx, Gy, Gz = self.grid_size
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        Gx, Gy, Gz = grid
         device = feat_2d.device
 
         x = feat_2d.reshape(B * N, C, H_t, W_t)
@@ -262,17 +282,34 @@ class LSSDepthLift(nn.Module):
         depth_prob = torch.softmax(depth_logits.float(), dim=1).to(dtype=img_feat.dtype)
 
         volumes = img_feat.new_zeros((B, N, self.out_channels, Gx, Gy, Gz))
-        T_velo_from_cam = torch.linalg.inv(T_cam_from_velo.to(device=device, dtype=torch.float32))
+        T_cam = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T_cam.ndim == 3:
+            T_cam = T_cam[:, None].expand(B, N, 4, 4)
+        T_velo_from_cam = torch.linalg.inv(T_cam)
+
+        origin = (
+            self.voxel_origin
+            if voxel_origin is None
+            else voxel_origin
+        ).to(device=device, dtype=torch.float32)
+        size = (
+            self.voxel_size
+            if voxel_size is None
+            else voxel_size
+        ).to(device=device, dtype=torch.float32)
 
         for b in range(B):
             for f in range(N):
                 lin, valid, hw_idx = self._frustum_voxel_indices(
                     K_per_frame[b, f],
-                    T_velo_from_cam[b],
+                    T_velo_from_cam[b, f],
                     H_t,
                     W_t,
                     image_hw[b],
                     device,
+                    voxel_origin=origin[b] if origin.ndim == 2 else origin,
+                    voxel_size=size[b] if size.ndim == 2 else size,
+                    grid_size=grid,
                 )
                 valid_flat = valid.reshape(-1)
                 if not bool(valid_flat.any().item()):
@@ -382,15 +419,29 @@ class PerFrameLidarMemory(nn.Module):
         self,
         points_per_frame: List[List[torch.Tensor]],
         output_dtype: torch.dtype,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B = len(points_per_frame)
         if B == 0:
             raise RuntimeError("points_per_frame must contain at least one sample.")
         N = len(points_per_frame[0])
         memories: List[torch.Tensor] = []
+        origin = None if voxel_origin is None else voxel_origin.to(
+            device=self.encoder.vox_origin.device, dtype=torch.float32
+        )
+        size = None if voxel_size is None else voxel_size.to(
+            device=self.encoder.vox_size.device, dtype=torch.float32
+        )
         for f in range(N):
             points_list = [points_per_frame[b][f] for b in range(B)]
-            mem, occ = self.encoder(points_list)
+            mem, occ = self.encoder(
+                points_list,
+                vox_origin=None if origin is None else origin[0],
+                vox_size=None if size is None else size[0],
+                vox_grid=grid_size,
+            )
             mem = mem.to(dtype=output_dtype)
             occ = occ.to(dtype=output_dtype)
             empty = self.empty_embed.view(1, -1, 1, 1, 1).to(
@@ -467,10 +518,30 @@ class FrameVolumeWarper(nn.Module):
         self.register_buffer("voxel_origin", origin, persistent=False)
         self.register_buffer("voxel_size", size, persistent=False)
 
+    @staticmethod
+    def _centers_for_grid(
+        grid_size: Tuple[int, int, int],
+        voxel_origin: torch.Tensor,
+        voxel_size: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        Gx, Gy, Gz = tuple(int(v) for v in grid_size)
+        ix = torch.arange(Gx, dtype=torch.float32, device=device)
+        iy = torch.arange(Gy, dtype=torch.float32, device=device)
+        iz = torch.arange(Gz, dtype=torch.float32, device=device)
+        grid_ix, grid_iy, grid_iz = torch.meshgrid(ix, iy, iz, indexing="ij")
+        idx = torch.stack([grid_ix, grid_iy, grid_iz], dim=-1)
+        return (idx + 0.5) * voxel_size.to(device=device, dtype=torch.float32) + voxel_origin.to(
+            device=device, dtype=torch.float32
+        )
+
     def _warp_one(
         self,
         volume: torch.Tensor,  # (B, C, X, Y, Z)
         T_target_from_frame_velo: torch.Tensor,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B, _C, Gx, Gy, Gz = volume.shape
         device = volume.device
@@ -478,13 +549,26 @@ class FrameVolumeWarper(nn.Module):
         R_inv = T_inv[:, :3, :3]
         t_inv = T_inv[:, :3, 3]
 
-        centers = self.target_centers.to(device=device, dtype=torch.float32)
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        origin = (
+            self.voxel_origin
+            if voxel_origin is None
+            else voxel_origin
+        ).to(device=device, dtype=torch.float32)
+        size = (
+            self.voxel_size
+            if voxel_size is None
+            else voxel_size
+        ).to(device=device, dtype=torch.float32)
+        centers = (
+            self.target_centers.to(device=device, dtype=torch.float32)
+            if grid == self.grid_size and voxel_origin is None and voxel_size is None
+            else self._centers_for_grid(grid, origin, size, device)
+        )
         flat_centers = centers.reshape(-1, 3).unsqueeze(0).expand(B, -1, 3)
         p_frame = torch.einsum("bij,bvj->bvi", R_inv, flat_centers) + t_inv.unsqueeze(1)
         p_frame = p_frame.view(B, Gx, Gy, Gz, 3)
 
-        origin = self.voxel_origin.to(device=device, dtype=torch.float32)
-        size = self.voxel_size.to(device=device, dtype=torch.float32)
         frac = (p_frame - origin) / size
         norm_x = (frac[..., 0] / float(Gx)) * 2.0 - 1.0
         norm_y = (frac[..., 1] / float(Gy)) * 2.0 - 1.0
@@ -506,22 +590,36 @@ class FrameVolumeWarper(nn.Module):
         T_target_from_refcam: torch.Tensor,    # (B, 4, 4)
         T_cam_from_velo: torch.Tensor,         # (B, 4, 4)
         cam2world_per_frame: torch.Tensor,     # (B, N, 4, 4)
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B, N, C, X, Y, Z = volumes.shape
-        if (X, Y, Z) != self.grid_size:
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        if (X, Y, Z) != grid:
             raise RuntimeError(
-                f"volume grid {(X, Y, Z)} does not match warper grid {self.grid_size}."
+                f"volume grid {(X, Y, Z)} does not match warper grid {grid}."
             )
         device = volumes.device
         T_tr = T_target_from_refcam.to(device=device, dtype=torch.float32)
         T_cv = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T_cv.ndim == 3:
+            T_cv = T_cv[:, None].expand(B, N, 4, 4)
         c2w = cam2world_per_frame.to(device=device, dtype=torch.float32)
         c2w_ref_inv = torch.linalg.inv(c2w[:, 0])
 
         warped: List[torch.Tensor] = []
         for f in range(N):
-            T_target_from_frame_velo = T_tr @ c2w_ref_inv @ c2w[:, f] @ T_cv
-            warped.append(self._warp_one(volumes[:, f], T_target_from_frame_velo))
+            T_target_from_frame_velo = T_tr @ c2w_ref_inv @ c2w[:, f] @ T_cv[:, f]
+            warped.append(
+                self._warp_one(
+                    volumes[:, f],
+                    T_target_from_frame_velo,
+                    voxel_origin=voxel_origin[0] if voxel_origin is not None and voxel_origin.ndim == 2 else voxel_origin,
+                    voxel_size=voxel_size[0] if voxel_size is not None and voxel_size.ndim == 2 else voxel_size,
+                    grid_size=grid,
+                )
+            )
         return torch.stack(warped, dim=1).view(B, N, C, X, Y, Z).contiguous()
 
 
@@ -697,8 +795,48 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         image_hw: torch.Tensor,
         gt_depth: Optional[torch.Tensor] = None,
         return_depth: bool = False,
+        grid_config: Optional[Dict[str, torch.Tensor | Tuple[int, int, int]]] = None,
     ) -> Dict[str, torch.Tensor]:
+        batch_size = int(T_target_from_refcam.shape[0])
+
+        def _grid_tuple(name: str, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
+            if grid_config is None or name not in grid_config:
+                return default
+            value = grid_config[name]
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 2:
+                    if value.shape[0] > 1 and not torch.equal(value, value[:1].expand_as(value)):
+                        raise RuntimeError(
+                            f"{name} must be identical within a batch; got {value.tolist()}"
+                        )
+                    value = value[0]
+                return tuple(int(v) for v in value.detach().cpu().tolist())
+            return tuple(int(v) for v in value)
+
+        def _grid_tensor(name: str, default: torch.Tensor, device: torch.device) -> torch.Tensor:
+            if grid_config is None or name not in grid_config:
+                return default.to(device=device, dtype=torch.float32).view(1, 3)
+            value = grid_config[name]
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, dtype=torch.float32)
+            value = value.to(device=device, dtype=torch.float32)
+            if value.ndim == 1:
+                value = value.view(1, 3)
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1)
+            return value
+
+        half_grid = _grid_tuple("half_grid_size", self.half_grid_size)
+        full_grid = _grid_tuple("grid_size", self.occ_head.full_grid)
+
         backbone_out = self.backbone(views)
+        fusion_origin = None
+        fusion_size = None
+        fusion_grid = None
+        if grid_config is not None:
+            fusion_origin = grid_config.get("fusion_vox_origin")
+            fusion_size = grid_config.get("fusion_vox_size")
+            fusion_grid = _grid_tuple("fusion_vox_grid", self.fusion.vfe.vox_grid)
         t_rec_fused = self.fusion(
             backbone_out["t_rec"],
             points_per_frame=points_per_frame,
@@ -707,6 +845,9 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             image_hw=image_hw,
             p_rec_local=backbone_out.get("p_rec_local"),
             c_rec=backbone_out["c_rec"],
+            fusion_vox_origin=fusion_origin,
+            fusion_vox_size=fusion_size,
+            fusion_vox_grid=fusion_grid,
         )
         B, N = t_rec_fused.shape[:2]
         if N != self.num_frames:
@@ -715,14 +856,25 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             )
 
         feat_2d = self.token_projector(t_rec_fused)
+        half_origin = _grid_tensor("half_voxel_origin", self.lss.voxel_origin, feat_2d.device)
+        half_size = _grid_tensor("half_voxel_size", self.lss.voxel_size, feat_2d.device)
         lss_volume, depth_logits = self.lss(
             feat_2d=feat_2d,
             K_per_frame=K_per_frame.to(device=feat_2d.device),
             T_cam_from_velo=T_cam_from_velo.to(device=feat_2d.device),
             image_hw=image_hw.to(device=feat_2d.device),
             gt_depth=gt_depth,
+            voxel_origin=half_origin,
+            voxel_size=half_size,
+            grid_size=half_grid,
         )
-        memory = self.lidar_memory(points_per_frame, output_dtype=lss_volume.dtype)
+        memory = self.lidar_memory(
+            points_per_frame,
+            output_dtype=lss_volume.dtype,
+            voxel_origin=half_origin,
+            voxel_size=half_size,
+            grid_size=half_grid,
+        )
         memory = memory.to(device=lss_volume.device, dtype=lss_volume.dtype)
         enhanced = self.natten_fusion(lss_volume, memory)
         per_frame = torch.cat([enhanced, memory], dim=2)  # (B, N, 64, X, Y, Z)
@@ -733,11 +885,14 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             T_target_from_refcam=T_target_from_refcam.to(device=per_frame.device),
             T_cam_from_velo=T_cam_from_velo.to(device=per_frame.device),
             cam2world_per_frame=cam2world,
+            voxel_origin=half_origin.to(device=per_frame.device),
+            voxel_size=half_size.to(device=per_frame.device),
+            grid_size=half_grid,
         )
         B, N, C, X, Y, Z = warped.shape
         temporal = warped.view(B, N * C, X, Y, Z)
         temporal = self.temporal_reduce(temporal)
-        logits = self.occ_head(temporal)
+        logits = self.occ_head(temporal, full_grid=full_grid)
         out: Dict[str, torch.Tensor] = {"ssc_logit": logits}
         if return_depth:
             if gt_depth is None:
