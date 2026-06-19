@@ -22,6 +22,8 @@ from .unified_occ import NUSCENES_GRID_CONFIG, remap_nuscenes_labels
 class NuScenes5FrameStage1LidarDataset(Dataset):
     """Front-camera 5-frame Occ3D-nuScenes dataset in the Stage-1 batch format."""
 
+    dense_depth_keys = ("dense_depthmap", "depthmap")
+
     class_names = (
         "other",
         "barrier",
@@ -234,6 +236,31 @@ class NuScenes5FrameStage1LidarDataset(Dataset):
             "label": f"{scene}_{frame:06d}_cam0",
         }
 
+    def _load_dense_depth(self, scene: str, frame: int) -> Tuple[np.ndarray, bool]:
+        with np.load(self._frame_npz(scene, frame)) as npz:
+            image = np.asarray(npz["image"])
+            intrinsics = np.asarray(npz["intrinsics"], dtype=np.float64)
+            depth = None
+            for key in self.dense_depth_keys:
+                if key in npz.files:
+                    depth = np.asarray(npz[key], dtype=np.float32)
+                    break
+            if depth is None:
+                depth = np.zeros(image.shape[:2], dtype=np.float32)
+
+        img_pil = Image.fromarray(image)
+        _img_out, depth_out, _intr_out = crop_resize_if_necessary(
+            img_pil,
+            depth,
+            intrinsics,
+            self.output_resolution,
+        )
+        depth_out = np.asarray(depth_out, dtype=np.float32)
+        valid = np.isfinite(depth_out) & (depth_out > 0.0)
+        if not bool(valid.any()):
+            return np.zeros_like(depth_out, dtype=np.float32), False
+        return np.where(valid, depth_out, 0.0).astype(np.float32), True
+
     def _load_points(self, scene: str, frame: int) -> torch.Tensor:
         pts = np.fromfile(self._lidar_bin(scene, frame), dtype=np.float32).reshape(-1, 4)
         if self.max_points_per_sweep > 0 and pts.shape[0] > self.max_points_per_sweep:
@@ -278,6 +305,12 @@ class NuScenes5FrameStage1LidarDataset(Dataset):
 
         image_hw = np.asarray(views[0]["true_shape"], dtype=np.int32).reshape(2)
         points_per_frame = [self._load_points(scene, int(fid)) for fid in frame_ids]
+        dense_depths: List[torch.Tensor] = []
+        dense_depth_frame_mask: List[bool] = []
+        for fid in frame_ids:
+            depth, has_depth = self._load_dense_depth(scene, int(fid))
+            dense_depths.append(torch.from_numpy(depth))
+            dense_depth_frame_mask.append(bool(has_depth))
         grid = self.grid_config.as_tensors()
 
         return {
@@ -290,6 +323,8 @@ class NuScenes5FrameStage1LidarDataset(Dataset):
             "K_per_frame": torch.from_numpy(np.stack(K_per_frame, axis=0)),
             "image_hw": torch.from_numpy(image_hw),
             "points_per_frame": points_per_frame,
+            "dense_depth": torch.stack(dense_depths, dim=0),
+            "dense_depth_frame_mask": torch.tensor(dense_depth_frame_mask, dtype=torch.bool),
             "dataset_name": "nuscenes",
             "sequence": scene,
             "target_frame_id": int(t),
@@ -304,6 +339,10 @@ def collate_stage1_nuscenes_lidar(batch: List[Dict[str, Any]]) -> Dict[str, Any]
     out["K_per_frame"] = torch.stack([b["K_per_frame"] for b in batch], dim=0)
     out["image_hw"] = torch.stack([b["image_hw"] for b in batch], dim=0)
     out["points_per_frame"] = [b["points_per_frame"] for b in batch]
+    out["dense_depth"] = torch.stack([b["dense_depth"] for b in batch], dim=0)
+    out["dense_depth_frame_mask"] = torch.stack(
+        [b["dense_depth_frame_mask"] for b in batch], dim=0
+    )
     out["dataset_name"] = [b["dataset_name"] for b in batch]
     out["half_grid_size"] = torch.stack([b["half_grid_size"] for b in batch], dim=0)
     out["half_voxel_origin"] = torch.stack([b["half_voxel_origin"] for b in batch], dim=0)

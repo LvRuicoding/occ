@@ -432,8 +432,15 @@ def _build_dataset(args, split: str) -> Dataset:
     if not bool(getattr(args, "multi_dataset", False)):
         return _build_kitti_dataset(args, split)
 
-    if args.exp != "bevdetocc_lidar":
-        raise ValueError("--multi_dataset currently supports --exp=bevdetocc_lidar only.")
+    if args.exp not in (
+        "bevdetocc_lidar",
+        "bevdetocc_lidar_pointmap",
+        "pointmap_postfusion_only",
+    ):
+        raise ValueError(
+            "--multi_dataset currently supports --exp=bevdetocc_lidar or "
+            "--exp=bevdetocc_lidar_pointmap or --exp=pointmap_postfusion_only only."
+        )
     if int(args.batch_size) != 1:
         raise ValueError("--multi_dataset requires --batch_size=1 because grid shapes differ.")
 
@@ -517,6 +524,8 @@ def _collate_fn(args):
                 )
             if names[0] == "nuscenes":
                 return collate_stage1_nuscenes_lidar(batch)
+            if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
+                return collate_stage1_lidar_dense_depth(batch)
             return collate_stage1_lidar(batch)
         return _collate_multi
     if args.exp in BEVDETOCC_DENSE_DEPTH_DATA_EXPS:
@@ -770,7 +779,7 @@ def _make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer | None:
             clean = name.removeprefix("module.")
             if clean.startswith("occ_head.predicter.2."):
                 classifier_params.append(param)
-            elif clean.startswith("occ_head."):
+            elif clean.startswith("occ_head.") or clean.startswith("pointmap_head."):
                 head_params.append(param)
             else:
                 base_params.append(param)
@@ -891,6 +900,7 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             batch["T_cam_from_velo"].to(device, non_blocking=True),
             batch["K_per_frame"].to(device, non_blocking=True),
             batch["image_hw"].to(device, non_blocking=True),
+            grid_config=grid_config,
         )
     if args.exp == "pointmap_original":
         return model(views, T_target_from_refcam)

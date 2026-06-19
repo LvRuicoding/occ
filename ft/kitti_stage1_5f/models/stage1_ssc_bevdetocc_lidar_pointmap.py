@@ -109,8 +109,48 @@ class Stage1SSCBEVDetOccLidarPointmapModel(Stage1SSCBEVDetOccLidarModel):
         image_hw: torch.Tensor,
         gt_depth: Optional[torch.Tensor] = None,
         return_depth: bool = False,
+        grid_config: Optional[Dict[str, torch.Tensor | Tuple[int, int, int]]] = None,
     ) -> Dict[str, torch.Tensor]:
+        batch_size = int(T_target_from_refcam.shape[0])
+
+        def _grid_tuple(name: str, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
+            if grid_config is None or name not in grid_config:
+                return default
+            value = grid_config[name]
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 2:
+                    if value.shape[0] > 1 and not torch.equal(value, value[:1].expand_as(value)):
+                        raise RuntimeError(
+                            f"{name} must be identical within a batch; got {value.tolist()}"
+                        )
+                    value = value[0]
+                return tuple(int(v) for v in value.detach().cpu().tolist())
+            return tuple(int(v) for v in value)
+
+        def _grid_tensor(name: str, default: torch.Tensor, device: torch.device) -> torch.Tensor:
+            if grid_config is None or name not in grid_config:
+                return default.to(device=device, dtype=torch.float32).view(1, 3)
+            value = grid_config[name]
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, dtype=torch.float32)
+            value = value.to(device=device, dtype=torch.float32)
+            if value.ndim == 1:
+                value = value.view(1, 3)
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1)
+            return value
+
+        half_grid = _grid_tuple("half_grid_size", self.half_grid_size)
+        full_grid = _grid_tuple("grid_size", self.occ_head.full_grid)
+
         backbone_out = self.backbone(views)
+        fusion_origin = None
+        fusion_size = None
+        fusion_grid = None
+        if grid_config is not None:
+            fusion_origin = grid_config.get("fusion_vox_origin")
+            fusion_size = grid_config.get("fusion_vox_size")
+            fusion_grid = _grid_tuple("fusion_vox_grid", self.fusion.vfe.vox_grid)
         t_rec_fused = self.fusion(
             backbone_out["t_rec"],
             points_per_frame=points_per_frame,
@@ -119,6 +159,9 @@ class Stage1SSCBEVDetOccLidarPointmapModel(Stage1SSCBEVDetOccLidarModel):
             image_hw=image_hw,
             p_rec_local=backbone_out.get("p_rec_local"),
             c_rec=backbone_out["c_rec"],
+            fusion_vox_origin=fusion_origin,
+            fusion_vox_size=fusion_size,
+            fusion_vox_grid=fusion_grid,
         )
         B, N = t_rec_fused.shape[:2]
         if N != self.num_frames:
@@ -132,14 +175,25 @@ class Stage1SSCBEVDetOccLidarPointmapModel(Stage1SSCBEVDetOccLidarModel):
         )
 
         feat_2d = self.token_projector(t_rec_fused)
+        half_origin = _grid_tensor("half_voxel_origin", self.lss.voxel_origin, feat_2d.device)
+        half_size = _grid_tensor("half_voxel_size", self.lss.voxel_size, feat_2d.device)
         lss_volume, depth_logits = self.lss(
             feat_2d=feat_2d,
             K_per_frame=K_per_frame.to(device=feat_2d.device),
             T_cam_from_velo=T_cam_from_velo.to(device=feat_2d.device),
             image_hw=image_hw.to(device=feat_2d.device),
             gt_depth=gt_depth,
+            voxel_origin=half_origin,
+            voxel_size=half_size,
+            grid_size=half_grid,
         )
-        memory = self.lidar_memory(points_per_frame, output_dtype=lss_volume.dtype)
+        memory = self.lidar_memory(
+            points_per_frame,
+            output_dtype=lss_volume.dtype,
+            voxel_origin=half_origin,
+            voxel_size=half_size,
+            grid_size=half_grid,
+        )
         memory = memory.to(device=lss_volume.device, dtype=lss_volume.dtype)
         enhanced = self.natten_fusion(lss_volume, memory)
         per_frame = torch.cat([enhanced, memory], dim=2)
@@ -150,11 +204,14 @@ class Stage1SSCBEVDetOccLidarPointmapModel(Stage1SSCBEVDetOccLidarModel):
             T_target_from_refcam=T_target_from_refcam.to(device=per_frame.device),
             T_cam_from_velo=T_cam_from_velo.to(device=per_frame.device),
             cam2world_per_frame=cam2world,
+            voxel_origin=half_origin.to(device=per_frame.device),
+            voxel_size=half_size.to(device=per_frame.device),
+            grid_size=half_grid,
         )
         B, N, C, X, Y, Z = warped.shape
         temporal = warped.view(B, N * C, X, Y, Z)
         temporal = self.temporal_reduce(temporal)
-        logits = self.occ_head(temporal)
+        logits = self.occ_head(temporal, full_grid=full_grid)
         out: Dict[str, torch.Tensor] = {"ssc_logit": logits}
         out.update(pointmap_out)
         if return_depth:
