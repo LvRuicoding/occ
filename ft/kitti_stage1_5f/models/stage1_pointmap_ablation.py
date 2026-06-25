@@ -15,6 +15,240 @@ from .stage1_ssc_bevdetocc_lidar_pointmap import (
 )
 
 
+def _resolve_image_hw(
+    views: List[Dict[str, torch.Tensor]],
+    image_hw: Optional[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    if image_hw is not None:
+        return image_hw.to(device=device, dtype=torch.long)
+    if not views or "true_shape" not in views[0]:
+        raise RuntimeError("dense depth head needs image_hw or views[0]['true_shape'].")
+    value = views[0]["true_shape"]
+    if not isinstance(value, torch.Tensor):
+        value = torch.as_tensor(value)
+    value = value.to(device=device, dtype=torch.long)
+    if value.ndim == 1:
+        value = value.view(1, 2)
+    if value.ndim != 2 or value.shape[1] != 2:
+        raise RuntimeError(f"true_shape/image_hw must be (B,2), got {tuple(value.shape)}.")
+    return value
+
+
+class Stage1DepthOriginalModel(nn.Module):
+    """OccAny reconstruction tokens plus a DPT dense-depth head, no LiDAR fusion."""
+
+    def __init__(
+        self,
+        occany_ckpt: Optional[str] = None,
+        c_lift: int = 64,
+        patch_size: int = 16,
+        token_dim: int = 768,
+        backbone_img_size: Tuple[int, int] = (512, 512),
+        backbone_dtype: torch.dtype = torch.bfloat16,
+        num_frames: int = 5,
+        freeze_backbone: bool = False,
+        dense_depth_features: int = 128,
+        dense_depth_initial: float = 10.0,
+        **_unused,
+    ) -> None:
+        super().__init__()
+        del c_lift
+        self.num_frames = int(num_frames)
+        self.freeze_backbone = bool(freeze_backbone)
+        self.backbone = OccAnyRecon5FrameBackbone(
+            img_size=backbone_img_size,
+            embed_dim=token_dim,
+            patch_size=patch_size,
+            backbone_dtype=backbone_dtype,
+            freeze=self.freeze_backbone,
+        )
+        if occany_ckpt is not None:
+            self.backbone.load_checkpoint(occany_ckpt)
+        self.dense_depth_head = SingleScaleDPTDepthHead(
+            token_dim=token_dim,
+            patch_size=patch_size,
+            features=int(dense_depth_features),
+            initial_depth=float(dense_depth_initial),
+        )
+
+    def pretrained_parameter_prefixes(self) -> Tuple[str, ...]:
+        return ("backbone.",)
+
+    def set_freeze_backbone(self, freeze: bool = True) -> None:
+        self.freeze_backbone = bool(freeze)
+        self.backbone.set_frozen(self.freeze_backbone)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(
+        self,
+        views: List[Dict[str, torch.Tensor]],
+        T_target_from_refcam: Optional[torch.Tensor] = None,
+        points_per_frame: Optional[List[List[torch.Tensor]]] = None,
+        T_cam_from_velo: Optional[torch.Tensor] = None,
+        K_per_frame: Optional[torch.Tensor] = None,
+        image_hw: Optional[torch.Tensor] = None,
+        gt_depth: Optional[torch.Tensor] = None,
+        return_depth: bool = False,
+        grid_config: Optional[Dict[str, torch.Tensor | Tuple[int, int, int]]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        del T_target_from_refcam, points_per_frame, T_cam_from_velo
+        del K_per_frame, gt_depth, return_depth, grid_config
+        backbone_out = self.backbone(views)
+        tokens = backbone_out["t_rec"]
+        if tokens.shape[1] != self.num_frames:
+            raise RuntimeError(
+                f"model was built for num_frames={self.num_frames}, "
+                f"got input N={tokens.shape[1]}."
+            )
+        dense_depth = self.dense_depth_head(
+            tokens,
+            _resolve_image_hw(views, image_hw, tokens.device),
+        )
+        return {"dense_depth": dense_depth}
+
+
+class Stage1DepthPostFusionOnlyModel(nn.Module):
+    """Post-2D-fusion reconstruction tokens plus a DPT dense-depth head."""
+
+    def __init__(
+        self,
+        occany_ckpt: Optional[str] = None,
+        c_lift: int = 64,
+        patch_size: int = 16,
+        token_dim: int = 768,
+        backbone_img_size: Tuple[int, int] = (512, 512),
+        backbone_dtype: torch.dtype = torch.bfloat16,
+        num_frames: int = 5,
+        freeze_backbone: bool = False,
+        dense_depth_features: int = 128,
+        dense_depth_initial: float = 10.0,
+        fusion_vox_origin: Tuple[float, float, float] = (-25.6, -2.0, 0.0),
+        fusion_vox_size: Tuple[float, float, float] = (0.4, 0.4, 0.4),
+        fusion_vox_grid: Tuple[int, int, int] = (128, 16, 128),
+        fusion_num_heads: int = 8,
+        fusion_window: int = 4,
+        fusion_d_voxel: int = 128,
+        fusion_pe_num_freqs: int = 8,
+        fusion_attn_type: str = "cross",
+        **_unused,
+    ) -> None:
+        super().__init__()
+        del c_lift
+        if fusion_attn_type != "cross":
+            raise ValueError(
+                "Stage1DepthPostFusionOnlyModel keeps the 2D fusion as "
+                f"cross-attention; got fusion_attn_type={fusion_attn_type!r}."
+            )
+        self.num_frames = int(num_frames)
+        self.freeze_backbone = bool(freeze_backbone)
+        self.backbone = OccAnyRecon5FrameBackbone(
+            img_size=backbone_img_size,
+            embed_dim=token_dim,
+            patch_size=patch_size,
+            backbone_dtype=backbone_dtype,
+            freeze=self.freeze_backbone,
+        )
+        if occany_ckpt is not None:
+            self.backbone.load_checkpoint(occany_ckpt)
+
+        H_t = backbone_img_size[0] // int(patch_size)
+        W_t = backbone_img_size[1] // int(patch_size)
+        self.fusion = LidarImageFusionModule(
+            d_model=token_dim,
+            H_t=H_t,
+            W_t=W_t,
+            patch_size=patch_size,
+            num_heads=fusion_num_heads,
+            window=fusion_window,
+            vox_origin=fusion_vox_origin,
+            vox_size=fusion_vox_size,
+            vox_grid=fusion_vox_grid,
+            vfe_d_voxel=fusion_d_voxel,
+            pe_num_freqs=fusion_pe_num_freqs,
+            attn_type="cross",
+            fusion3d_enabled=False,
+        )
+        self.dense_depth_head = SingleScaleDPTDepthHead(
+            token_dim=token_dim,
+            patch_size=patch_size,
+            features=int(dense_depth_features),
+            initial_depth=float(dense_depth_initial),
+        )
+
+    def pretrained_parameter_prefixes(self) -> Tuple[str, ...]:
+        return ("backbone.",)
+
+    def set_freeze_backbone(self, freeze: bool = True) -> None:
+        self.freeze_backbone = bool(freeze)
+        self.backbone.set_frozen(self.freeze_backbone)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(
+        self,
+        views: List[Dict[str, torch.Tensor]],
+        T_target_from_refcam: torch.Tensor,
+        points_per_frame: List[List[torch.Tensor]],
+        T_cam_from_velo: torch.Tensor,
+        K_per_frame: torch.Tensor,
+        image_hw: torch.Tensor,
+        gt_depth: Optional[torch.Tensor] = None,
+        return_depth: bool = False,
+        grid_config: Optional[Dict[str, torch.Tensor | Tuple[int, int, int]]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        del T_target_from_refcam, gt_depth, return_depth
+        fusion_origin = None
+        fusion_size = None
+        fusion_grid = None
+        if grid_config is not None:
+            fusion_origin = grid_config.get("fusion_vox_origin")
+            fusion_size = grid_config.get("fusion_vox_size")
+            value = grid_config.get("fusion_vox_grid")
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 2:
+                    if value.shape[0] > 1 and not torch.equal(value, value[:1].expand_as(value)):
+                        raise RuntimeError(
+                            f"fusion_vox_grid must be identical within a batch; got {value.tolist()}"
+                        )
+                    value = value[0]
+                fusion_grid = tuple(int(v) for v in value.detach().cpu().tolist())
+            elif value is not None:
+                fusion_grid = tuple(int(v) for v in value)
+        backbone_out = self.backbone(views)
+        t_rec_fused = self.fusion(
+            backbone_out["t_rec"],
+            points_per_frame=points_per_frame,
+            T_cam_from_velo=T_cam_from_velo,
+            K_per_frame=K_per_frame,
+            image_hw=image_hw,
+            p_rec_local=backbone_out.get("p_rec_local"),
+            c_rec=backbone_out["c_rec"],
+            fusion_vox_origin=fusion_origin,
+            fusion_vox_size=fusion_size,
+            fusion_vox_grid=fusion_grid,
+        )
+        if t_rec_fused.shape[1] != self.num_frames:
+            raise RuntimeError(
+                f"model was built for num_frames={self.num_frames}, "
+                f"got input N={t_rec_fused.shape[1]}."
+            )
+        dense_depth = self.dense_depth_head(
+            t_rec_fused,
+            _resolve_image_hw(views, image_hw, t_rec_fused.device),
+        )
+        return {"dense_depth": dense_depth}
+
+
 class Stage1PointmapOriginalModel(nn.Module):
     """Original OccAny pointmap head without LiDAR/image fusion or SSC backend."""
 
@@ -390,6 +624,8 @@ class Stage1SSCBEVDetOccLidarPointmapDenseDepthModel(
 
 
 __all__ = [
+    "Stage1DepthOriginalModel",
+    "Stage1DepthPostFusionOnlyModel",
     "Stage1PointmapOriginalModel",
     "Stage1PointmapPostFusionOnlyModel",
     "Stage1SSCBEVDetOccLidarPointmapDenseDepthModel",

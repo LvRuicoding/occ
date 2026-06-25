@@ -24,6 +24,8 @@ from .stage1_ssc_bevdetocc_lidar_pointmap import (
     pointmap_reconstruction_loss,
 )
 from .stage1_pointmap_ablation import (
+    Stage1DepthOriginalModel,
+    Stage1DepthPostFusionOnlyModel,
     Stage1PointmapOriginalModel,
     Stage1PointmapPostFusionOnlyModel,
     Stage1SSCBEVDetOccLidarPointmapDenseDepthModel,
@@ -41,6 +43,8 @@ __all__ = [
     "Stage1SSCBEVDetOccLidarModel",
     "Stage1SSCBEVDetOccLidarDenseDepthModel",
     "Stage1SSCBEVDetOccLidarPointmapModel",
+    "Stage1DepthOriginalModel",
+    "Stage1DepthPostFusionOnlyModel",
     "Stage1PointmapOriginalModel",
     "Stage1PointmapPostFusionOnlyModel",
     "Stage1SSCBEVDetOccLidarPointmapDenseDepthModel",
