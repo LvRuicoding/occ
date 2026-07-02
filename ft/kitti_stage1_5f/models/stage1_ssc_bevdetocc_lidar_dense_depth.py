@@ -1,6 +1,7 @@
 """BEVDet-OCC LiDAR model with DPT-style dense depth auxiliary supervision."""
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,21 +28,42 @@ class _ResidualConvUnit(nn.Module):
 
 
 class _FeatureFusionBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, prompt_depth_enabled: bool = False) -> None:
         super().__init__()
         self.res1 = _ResidualConvUnit(channels)
         self.res2 = _ResidualConvUnit(channels)
+        self.prompt_depth_enabled = bool(prompt_depth_enabled)
+        if self.prompt_depth_enabled:
+            self.res_prompt_depth = nn.Sequential(
+                nn.Conv2d(2, channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            )
+            nn.init.zeros_(self.res_prompt_depth[-1].weight)
+            nn.init.zeros_(self.res_prompt_depth[-1].bias)
 
     def forward(
         self,
         x: torch.Tensor,
         skip: Optional[torch.Tensor] = None,
+        prompt_depth: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if skip is not None:
             if x.shape[-2:] != skip.shape[-2:]:
                 x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=True)
             x = x + self.res1(skip)
-        return self.res2(x)
+        x = self.res2(x)
+        if self.prompt_depth_enabled and prompt_depth is not None:
+            prompt = F.interpolate(
+                prompt_depth,
+                size=x.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            x = x + self.res_prompt_depth(prompt)
+        return x
 
 
 class SingleScaleDPTDepthHead(nn.Module):
@@ -59,9 +81,28 @@ class SingleScaleDPTDepthHead(nn.Module):
         features: int = 128,
         out_channels: Tuple[int, int, int, int] = (96, 192, 384, 384),
         initial_depth: float = 10.0,
+        prompt_depth_enabled: bool = False,
+        prompt_depth_scale: str = "log",
+        prompt_depth_min: float = 1e-3,
+        prompt_depth_max: float = 120.0,
     ) -> None:
         super().__init__()
         self.patch_size = int(patch_size)
+        self.prompt_depth_enabled = bool(prompt_depth_enabled)
+        self.prompt_depth_scale = str(prompt_depth_scale)
+        self.prompt_depth_min = float(prompt_depth_min)
+        self.prompt_depth_max = float(prompt_depth_max)
+        if self.prompt_depth_enabled:
+            valid_scales = ("log", "linear", "per_frame_max")
+            if self.prompt_depth_scale not in valid_scales:
+                raise ValueError(
+                    f"prompt_depth_scale must be one of {valid_scales}, "
+                    f"got {self.prompt_depth_scale!r}."
+                )
+            if self.prompt_depth_min <= 0.0:
+                raise ValueError("prompt_depth_min must be > 0.")
+            if self.prompt_depth_max <= self.prompt_depth_min:
+                raise ValueError("prompt_depth_max must be > prompt_depth_min.")
         self.norm = nn.LayerNorm(int(token_dim))
         self.projects = nn.ModuleList(
             [nn.Conv2d(int(token_dim), int(c), kernel_size=1) for c in out_channels]
@@ -77,10 +118,10 @@ class SingleScaleDPTDepthHead(nn.Module):
         self.adapters = nn.ModuleList(
             [nn.Conv2d(int(c), int(features), kernel_size=3, padding=1) for c in out_channels]
         )
-        self.refinenet1 = _FeatureFusionBlock(int(features))
-        self.refinenet2 = _FeatureFusionBlock(int(features))
-        self.refinenet3 = _FeatureFusionBlock(int(features))
-        self.refinenet4 = _FeatureFusionBlock(int(features))
+        self.refinenet1 = _FeatureFusionBlock(int(features), self.prompt_depth_enabled)
+        self.refinenet2 = _FeatureFusionBlock(int(features), self.prompt_depth_enabled)
+        self.refinenet3 = _FeatureFusionBlock(int(features), self.prompt_depth_enabled)
+        self.refinenet4 = _FeatureFusionBlock(int(features), self.prompt_depth_enabled)
         self.output_conv1 = nn.Conv2d(int(features), int(features) // 2, kernel_size=3, padding=1)
         self.output_conv2 = nn.Sequential(
             nn.Conv2d(int(features) // 2, 32, kernel_size=3, padding=1),
@@ -93,19 +134,21 @@ class SingleScaleDPTDepthHead(nn.Module):
         self,
         tokens: torch.Tensor,
         image_hw: torch.Tensor,
+        prompt_depth: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, H_t, W_t, C = tokens.shape
         x = self.norm(tokens)
         x = x.reshape(B * N, H_t, W_t, C).permute(0, 3, 1, 2).contiguous()
+        prompt = self._normalize_prompt_depth(prompt_depth, B, N) if prompt_depth is not None else None
 
         feats = []
         for project, resize, adapter in zip(self.projects, self.resize_layers, self.adapters):
             feats.append(adapter(resize(project(x))))
 
-        path = self.refinenet4(feats[3])
-        path = self.refinenet3(path, feats[2])
-        path = self.refinenet2(path, feats[1])
-        path = self.refinenet1(path, feats[0])
+        path = self.refinenet4(feats[3], prompt_depth=prompt)
+        path = self.refinenet3(path, feats[2], prompt_depth=prompt)
+        path = self.refinenet2(path, feats[1], prompt_depth=prompt)
+        path = self.refinenet1(path, feats[0], prompt_depth=prompt)
 
         H_img = int(image_hw[0, 0].item())
         W_img = int(image_hw[0, 1].item())
@@ -119,6 +162,54 @@ class SingleScaleDPTDepthHead(nn.Module):
         logits = self.output_conv2(path)
         depth = F.softplus(logits.float()).to(dtype=tokens.dtype) + 1e-3
         return depth.view(B, N, H_img, W_img)
+
+    def _normalize_prompt_depth(
+        self,
+        prompt_depth: torch.Tensor,
+        B: int,
+        N: int,
+    ) -> torch.Tensor:
+        if prompt_depth.ndim == 4:
+            if prompt_depth.shape[:2] != (B, N):
+                raise RuntimeError(
+                    f"prompt_depth must match tokens B,N={(B, N)}, got {tuple(prompt_depth.shape)}."
+                )
+            depth = prompt_depth
+            valid = torch.isfinite(depth) & (depth > 0.0)
+        elif prompt_depth.ndim == 5:
+            if prompt_depth.shape[:3] != (B, N, 2):
+                raise RuntimeError(
+                    "prompt_depth must be (B,N,2,H,W) when a mask channel is provided; "
+                    f"got {tuple(prompt_depth.shape)}."
+                )
+            depth = prompt_depth[:, :, 0]
+            valid = prompt_depth[:, :, 1] > 0.5
+            valid = valid & torch.isfinite(depth) & (depth > 0.0)
+        else:
+            raise RuntimeError(
+                "prompt_depth must be (B,N,H,W) or (B,N,2,H,W); "
+                f"got {tuple(prompt_depth.shape)}."
+            )
+
+        depth = depth.reshape(B * N, 1, depth.shape[-2], depth.shape[-1]).float()
+        valid = valid.reshape(B * N, 1, valid.shape[-2], valid.shape[-1])
+        depth = torch.where(valid, depth, torch.zeros_like(depth))
+
+        if self.prompt_depth_scale == "per_frame_max":
+            max_val = depth.flatten(1).amax(dim=1).view(B * N, 1, 1, 1).clamp_min(1e-6)
+            depth_norm = depth / max_val
+        elif self.prompt_depth_scale == "linear":
+            depth_clamped = depth.clamp(min=self.prompt_depth_min, max=self.prompt_depth_max)
+            depth_norm = (depth_clamped - self.prompt_depth_min) / (
+                self.prompt_depth_max - self.prompt_depth_min
+            )
+        else:
+            depth_clamped = depth.clamp(min=self.prompt_depth_min, max=self.prompt_depth_max)
+            denom = math.log(self.prompt_depth_max) - math.log(self.prompt_depth_min)
+            depth_norm = (torch.log(depth_clamped) - math.log(self.prompt_depth_min)) / denom
+
+        depth_norm = torch.where(valid, depth_norm.clamp(0.0, 1.0), torch.zeros_like(depth_norm))
+        return torch.cat([depth_norm, valid.to(dtype=depth_norm.dtype)], dim=1)
 
 
 def dense_metric_depth_loss(

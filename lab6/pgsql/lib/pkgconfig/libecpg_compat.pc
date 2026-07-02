@@ -1,0 +1,9 @@
+Name: libecpg_compat
+Description: PostgreSQL libecpg_compat library
+Url: http://www.postgresql.org/
+Version: 12.0
+Requires: 
+Requires.private: libecpg libpgtypes
+Cflags: -I/home/dataset-local/lr/code/OccAny/lab6/pgsql/include
+Libs: -L/home/dataset-local/lr/code/OccAny/lab6/pgsql/lib -lecpg_compat
+Libs.private:  -lm

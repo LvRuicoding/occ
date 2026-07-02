@@ -71,6 +71,7 @@ from ..losses_monoscene import MonoSceneSSCLoss
 from ..models import (
     Stage1DepthOriginalModel,
     Stage1DepthPostFusionOnlyModel,
+    Stage1DepthPromptFusionOnlyModel,
     Stage1SSCBEVDetOccLidarDenseDepthModel,
     Stage1SSCBEVDetOccLidarModel,
     Stage1SSCBEVDetOccLidarPointmapModel,
@@ -103,6 +104,7 @@ POINTMAP_ONLY_EXPS = (
 )
 DEPTH_ONLY_EXPS = (
     "depth_postfusion_only",
+    "depth_promptfusion_only",
     "depth_original",
 )
 POINTMAP_QUALITY_EXPS = (
@@ -116,6 +118,7 @@ BEVDETOCC_DENSE_DEPTH_DATA_EXPS = (
     "bevdetocc_lidar_pointmap_dense_depth",
     "pointmap_postfusion_only",
     "depth_postfusion_only",
+    "depth_promptfusion_only",
 )
 POINTMAP_DENSE_DEPTH_DATA_EXPS = (
     "pointmap_original",
@@ -126,6 +129,7 @@ LIDAR_EXPS = (
     *BEVDETOCC_LIDAR_EXPS,
     "pointmap_postfusion_only",
     "depth_postfusion_only",
+    "depth_promptfusion_only",
 )
 MONOSCENE_LOSS_EXPS = ("monoscene", "monoscene_lidar")
 
@@ -139,6 +143,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--occany_ckpt", required=True, type=str,
                    help="OccAny checkpoint (encoder+decoder sub-dicts).")
     p.add_argument("--output_dir", required=True, type=str)
+    p.add_argument(
+        "--backbone",
+        choices=["must3r", "da3"],
+        default="must3r",
+        help="Reconstruction backbone for supported Stage-1 variants.",
+    )
 
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=160)
@@ -216,6 +226,8 @@ def get_args_parser() -> argparse.ArgumentParser:
     #   - "depth_original": original OccAny reconstruction tokens + DPT dense
     #                         depth head only; no fusion, pointmap loss, or SSC.
     #   - "depth_postfusion_only": 2D LiDAR fusion + DPT dense depth head only.
+    #   - "depth_promptfusion_only": original reconstruction tokens + LiDAR
+    #                         sparse-depth prompt injected into the DPT decoder.
     p.add_argument(
         "--exp",
         choices=[
@@ -230,6 +242,7 @@ def get_args_parser() -> argparse.ArgumentParser:
             "bevdetocc_lidar_pointmap_dense_depth",
             "depth_original",
             "depth_postfusion_only",
+            "depth_promptfusion_only",
         ],
         default="light",
     )
@@ -274,6 +287,12 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="Weight for dense metric depth auxiliary loss.")
     p.add_argument("--dense_depth_features", type=int, default=128,
                    help="Feature width for the single-scale DPT-style dense depth head.")
+    p.add_argument("--prompt_depth_scale", choices=["log", "linear", "per_frame_max"], default="log",
+                   help="Scale used for depth_promptfusion_only LiDAR prompt depth values.")
+    p.add_argument("--prompt_depth_min", type=float, default=1e-3,
+                   help="Minimum metric depth used to normalize/filter LiDAR prompt depth.")
+    p.add_argument("--prompt_depth_max", type=float, default=120.0,
+                   help="Maximum metric depth used to normalize/filter LiDAR prompt depth.")
     p.add_argument("--pointmap_supervision", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable post-2D-fusion pointmap supervision for --exp=bevdetocc_lidar_pointmap.")
     p.add_argument("--pointmap_loss_weight", type=float, default=0.1,
@@ -748,6 +767,12 @@ def _set_occany_backbone_frozen(
     if backbone is None:
         return False
     freeze = bool(freeze)
+    if hasattr(backbone, "set_frozen") and not hasattr(backbone, "decoder"):
+        backbone.set_frozen(freeze)
+        if hasattr(model, "freeze_backbone"):
+            model.freeze_backbone = freeze
+        return freeze
+
     freeze_forward = freeze and not keep_pointmap_head_trainable
     if hasattr(backbone, "freeze"):
         backbone.freeze = freeze_forward
@@ -775,7 +800,12 @@ def _freeze_occany_backbone(model: nn.Module) -> bool:
 
 
 def _apply_backbone_freeze_state(model: nn.Module, args, epoch: int) -> bool:
-    if args.exp in DEPTH_ONLY_EXPS and bool(args.freeze_backbone) and int(args.freeze_backbone_epochs) == 0:
+    if (
+        args.exp in DEPTH_ONLY_EXPS
+        and getattr(args, "backbone", "must3r") == "must3r"
+        and bool(args.freeze_backbone)
+        and int(args.freeze_backbone_epochs) == 0
+    ):
         args.freeze_backbone = False
         print("[backbone] depth-only experiments fine-tune OccAny; forcing --no-freeze_backbone.")
     if not bool(args.freeze_backbone):
@@ -926,6 +956,16 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             grid_config=grid_config,
         )
     if args.exp == "depth_postfusion_only":
+        return model(
+            views,
+            T_target_from_refcam,
+            _move_points_to_device(batch["points_per_frame"], device),
+            batch["T_cam_from_velo"].to(device, non_blocking=True),
+            batch["K_per_frame"].to(device, non_blocking=True),
+            batch["image_hw"].to(device, non_blocking=True),
+            grid_config=grid_config,
+        )
+    if args.exp == "depth_promptfusion_only":
         return model(
             views,
             T_target_from_refcam,
@@ -1721,6 +1761,16 @@ def main():
     args.freeze_backbone_epochs = int(args.freeze_backbone_epochs)
     if args.freeze_backbone_epochs < 0:
         raise ValueError("--freeze_backbone_epochs must be >= 0.")
+    if args.backbone == "da3" and args.exp not in ("depth_original", "depth_postfusion_only"):
+        raise ValueError(
+            "--backbone da3 is currently wired for --exp depth_original "
+            "or --exp depth_postfusion_only only."
+        )
+    if args.backbone == "da3" and (
+        int(args.height) % int(args.patch_size) != 0
+        or int(args.width) % int(args.patch_size) != 0
+    ):
+        raise ValueError("--backbone da3 requires height/width divisible by --patch_size.")
 
     misc.init_distributed_mode(args)
     # xFormers C++ ext is unavailable on this cu126 env; fall back to PyTorch SDPA.
@@ -1755,6 +1805,8 @@ def main():
         model_cls = Stage1DepthOriginalModel
     elif args.exp == "depth_postfusion_only":
         model_cls = Stage1DepthPostFusionOnlyModel
+    elif args.exp == "depth_promptfusion_only":
+        model_cls = Stage1DepthPromptFusionOnlyModel
     elif args.exp == "bevdetocc_lidar_pointmap_dense_depth":
         model_cls = Stage1SSCBEVDetOccLidarPointmapDenseDepthModel
     elif args.exp == "bevdetocc_lidar_pointmap":
@@ -1782,15 +1834,23 @@ def main():
         model_kwargs["fusion_attn_type"] = "cross"
         model_kwargs["num_frames"] = args.num_frames
         model_kwargs["freeze_backbone"] = args.freeze_backbone
-    if args.exp in ("pointmap_original", "depth_original"):
+        if args.exp == "depth_postfusion_only":
+            model_kwargs["backbone"] = args.backbone
+    if args.exp in ("pointmap_original", "depth_original", "depth_promptfusion_only"):
         model_kwargs["num_frames"] = args.num_frames
         model_kwargs["freeze_backbone"] = args.freeze_backbone
+        if args.exp == "depth_original":
+            model_kwargs["backbone"] = args.backbone
     if args.exp in (
         "bevdetocc_lidar_dense_depth",
         "bevdetocc_lidar_pointmap_dense_depth",
         *DEPTH_ONLY_EXPS,
     ):
         model_kwargs["dense_depth_features"] = args.dense_depth_features
+    if args.exp == "depth_promptfusion_only":
+        model_kwargs["prompt_depth_scale"] = args.prompt_depth_scale
+        model_kwargs["prompt_depth_min"] = args.prompt_depth_min
+        model_kwargs["prompt_depth_max"] = args.prompt_depth_max
     if args.exp == "monoscene_lidar":
         model_kwargs["fusion_attn_type"] = args.fusion_attn_type
         model_kwargs["fusion3d_enabled"] = args.fusion3d
@@ -1810,6 +1870,8 @@ def main():
         model_kwargs["num_frames"] = args.num_frames
     model = model_cls(**model_kwargs).to(device)
     print(f"[exp={args.exp}] using {model_cls.__name__}")
+    if args.exp in ("depth_original", "depth_postfusion_only"):
+        print(f"[backbone] selected={args.backbone}")
     if args.exp in POINTMAP_ONLY_EXPS:
         print(
             f"[pointmap-only] weight={args.pointmap_loss_weight} "
@@ -1824,6 +1886,13 @@ def main():
         )
         if args.exp == "depth_postfusion_only":
             print("[fusion] attn_type=cross (depth-only post-fusion branch)")
+        if args.exp == "depth_promptfusion_only":
+            print(
+                "[fusion] prompt_depth=lidar_sparse+mask "
+                f"scale={args.prompt_depth_scale} "
+                f"min={args.prompt_depth_min:g} max={args.prompt_depth_max:g} "
+                "(PromptDA-style decoder injection)"
+            )
     if args.exp in BEVDETOCC_LIDAR_EXPS:
         print("[fusion] attn_type=cross (forced for BEVDet-OCC LiDAR branch)")
         print("[backend] LSS half-grid -> LiDAR memory -> NATTEN -> BEVDet CustomResNet3D/LSSFPN3D")
@@ -1867,10 +1936,10 @@ def main():
     backbone_frozen = _apply_backbone_freeze_state(model, args, 0)
     backbone_hash = (
         _state_dict_hash(model.backbone.state_dict())
-        if hasattr(model, "backbone")
+        if hasattr(model, "backbone") and getattr(args, "backbone", "must3r") == "must3r"
         else None
     )
-    print(f"[backbone] initial freeze={backbone_frozen} (OccAny reconstruction encoder/decoder)")
+    print(f"[backbone] initial freeze={backbone_frozen} (reconstruction backbone)")
     if args.freeze_backbone and args.freeze_backbone_epochs:
         print(
             f"[backbone] freeze_backbone_epochs={args.freeze_backbone_epochs} "

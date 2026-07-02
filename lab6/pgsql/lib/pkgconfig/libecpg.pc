@@ -1,0 +1,9 @@
+Name: libecpg
+Description: PostgreSQL libecpg library
+Url: http://www.postgresql.org/
+Version: 12.0
+Requires: 
+Requires.private: libpq libpgtypes
+Cflags: -I/home/dataset-local/lr/code/OccAny/lab6/pgsql/include
+Libs: -L/home/dataset-local/lr/code/OccAny/lab6/pgsql/lib -lecpg
+Libs.private:  -lm

@@ -46,6 +46,7 @@ from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
 from ft.kitti_stage1_5f.models import (
     Stage1DepthOriginalModel,
     Stage1DepthPostFusionOnlyModel,
+    Stage1DepthPromptFusionOnlyModel,
     Stage1PointmapOriginalModel,
     Stage1PointmapPostFusionOnlyModel,
     Stage1SSCBEVDetOccLidarPointmapDenseDepthModel,
@@ -61,6 +62,7 @@ from ft.kitti_stage1_5f.tools.train import (
 SUPPORTED_EXPS = (
     "depth_original",
     "depth_postfusion_only",
+    "depth_promptfusion_only",
     "pointmap_original",
     "pointmap_postfusion_only",
     "bevdetocc_lidar_pointmap_dense_depth",
@@ -155,7 +157,11 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args) -> None:
     args.c_lift = int(_ckpt_arg(ckpt_args, "c_lift", 64))
     args.token_dim = int(_ckpt_arg(ckpt_args, "token_dim", 768))
     args.patch_size = int(_ckpt_arg(ckpt_args, "patch_size", 16))
+    args.backbone = _ckpt_arg(ckpt_args, "backbone", "must3r")
     args.dense_depth_features = int(_ckpt_arg(ckpt_args, "dense_depth_features", 128))
+    args.prompt_depth_scale = _ckpt_arg(ckpt_args, "prompt_depth_scale", "log")
+    args.prompt_depth_min = float(_ckpt_arg(ckpt_args, "prompt_depth_min", 1e-3))
+    args.prompt_depth_max = float(_ckpt_arg(ckpt_args, "prompt_depth_max", 120.0))
     args.max_points_per_sweep = int(_ckpt_arg(ckpt_args, "max_points_per_sweep", 0))
     args.freeze_backbone = bool(_ckpt_arg(ckpt_args, "freeze_backbone", True))
     args.batch_size = int(_override_or_ckpt(args, ckpt_args, "batch_size", 1))
@@ -186,6 +192,8 @@ def _build_depth_eval_model(args: argparse.Namespace, device: torch.device) -> t
         model_cls = Stage1DepthOriginalModel
     elif args.exp == "depth_postfusion_only":
         model_cls = Stage1DepthPostFusionOnlyModel
+    elif args.exp == "depth_promptfusion_only":
+        model_cls = Stage1DepthPromptFusionOnlyModel
     elif args.exp == "pointmap_original":
         model_cls = Stage1PointmapOriginalModel
     elif args.exp == "pointmap_postfusion_only":
@@ -208,15 +216,22 @@ def _build_depth_eval_model(args: argparse.Namespace, device: torch.device) -> t
     if args.exp in (
         "depth_original",
         "depth_postfusion_only",
+        "depth_promptfusion_only",
         "bevdetocc_lidar_pointmap_dense_depth",
     ):
         model_kwargs["dense_depth_features"] = args.dense_depth_features
+    if args.exp == "depth_promptfusion_only":
+        model_kwargs["prompt_depth_scale"] = args.prompt_depth_scale
+        model_kwargs["prompt_depth_min"] = args.prompt_depth_min
+        model_kwargs["prompt_depth_max"] = args.prompt_depth_max
     if args.exp in (
         "pointmap_postfusion_only",
         "depth_postfusion_only",
         "bevdetocc_lidar_pointmap_dense_depth",
     ):
         model_kwargs["fusion_attn_type"] = "cross"
+    if args.exp in ("depth_original", "depth_postfusion_only"):
+        model_kwargs["backbone"] = args.backbone
     return model_cls(**model_kwargs).to(device)
 
 
@@ -829,11 +844,16 @@ def main() -> None:
     val_dataset = _build_dataset(args, "val")
     val_loader, rank_samples = _build_eval_loader(args, val_dataset)
 
-    backbone_hash = _state_dict_hash(model.backbone.state_dict())
+    backbone_hash = (
+        _state_dict_hash(model.backbone.state_dict())
+        if hasattr(model, "backbone") and getattr(args, "backbone", "must3r") == "must3r"
+        else None
+    )
     if misc.is_main_process():
         print(f"[depth-eval] ckpt={ckpt_path}")
         print(
-            f"[depth-eval] exp={args.exp} device={device} amp={args.amp} "
+            f"[depth-eval] exp={args.exp} backbone={getattr(args, 'backbone', 'must3r')} "
+            f"device={device} amp={args.amp} "
             f"val_samples={len(val_dataset)} rank0_samples={rank_samples} "
             f"world_size={misc.get_world_size()} batch_size={args.batch_size}"
         )
