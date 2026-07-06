@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 import dust3r.utils.path_to_croco  # noqa: F401
@@ -49,6 +49,8 @@ from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
 
 from ft.semantickitti_ft.losses import SSCLoss
 from ..datasets import (
+    DDAD5FrameStage1DenseDepthDataset,
+    DDAD5FrameStage1LidarDenseDepthDataset,
     KITTI_SSC_CLASS_NAMES,
     UNIFIED_SSC_CLASS_NAMES,
     Kitti5FrameStage1DenseDepthDataset,
@@ -255,8 +257,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--nuscenes_raw_root", default=None, type=str,
                    help="Deprecated compatibility option; nuScenes calibration/pose is read from "
                         "<nuscenes_processed_root>/<split>_scene-*/meta/*.npz.")
+    p.add_argument("--ddad_processed_root", default=None, type=str,
+                   help="Path to data/ddad_processed for KITTI+DDAD depth-only multi-dataset training.")
+    p.add_argument("--ddad_raw_root", default=None, type=str,
+                   help="Path to raw DDAD ddad_train_val root; required for DDAD LiDAR poses.")
     p.add_argument("--multi_dataset", action="store_true",
-                   help="Train BEVDet-OCC LiDAR with KITTI and Occ3D-nuScenes using shared weights.")
+                   help="Enable KITTI+nuScenes occupancy or KITTI+DDAD depth-only multi-dataset training.")
     p.add_argument("--dataset_ratio", type=str, default="1:1",
                    help="KITTI:nuScenes sampling ratio for --multi_dataset. Default: 1:1.")
     p.add_argument("--nuscenes_frame_stride", type=int, default=1,
@@ -413,6 +419,18 @@ def _parse_dataset_ratio(value: str) -> tuple[int, int]:
     return a, b
 
 
+def _multi_dataset_with_ddad(args) -> bool:
+    return bool(getattr(args, "multi_dataset", False) and getattr(args, "ddad_processed_root", None))
+
+
+def _multi_dataset_with_nuscenes(args) -> bool:
+    return bool(
+        getattr(args, "multi_dataset", False)
+        and getattr(args, "nuscenes_processed_root", None)
+        and not _multi_dataset_with_ddad(args)
+    )
+
+
 def _build_kitti_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
     common = dict(
         processed_root=args.processed_root,
@@ -460,6 +478,29 @@ def _build_nuscenes_dataset(args, split: str) -> NuScenes5FrameStage1LidarDatase
     )
 
 
+def _build_ddad_dataset(args, split: str) -> Dataset:
+    if not args.ddad_processed_root:
+        raise ValueError("--ddad_processed_root is required for DDAD training/eval.")
+    common = dict(
+        processed_root=args.ddad_processed_root,
+        raw_root=args.ddad_raw_root,
+        split=split,
+        num_frames=args.num_frames,
+        frame_stride=args.frame_stride,
+        output_resolution=(args.width, args.height),
+        cam_idx=0,
+        max_points_per_sweep=args.max_points_per_sweep,
+    )
+    if args.exp == "depth_original":
+        return DDAD5FrameStage1DenseDepthDataset(**common)
+    if args.exp == "depth_postfusion_only":
+        return DDAD5FrameStage1LidarDenseDepthDataset(**common)
+    raise ValueError(
+        "--multi_dataset with --ddad_processed_root supports only "
+        "--exp=depth_original or --exp=depth_postfusion_only."
+    )
+
+
 def _limit_dataset(dataset: Dataset, length: int) -> Dataset:
     length = int(length)
     if length <= 0 or len(dataset) <= length:
@@ -470,6 +511,26 @@ def _limit_dataset(dataset: Dataset, length: int) -> Dataset:
 def _build_dataset(args, split: str) -> Dataset:
     if not bool(getattr(args, "multi_dataset", False)):
         return _build_kitti_dataset(args, split)
+
+    if _multi_dataset_with_ddad(args):
+        if args.exp not in ("depth_original", "depth_postfusion_only"):
+            raise ValueError(
+                "--multi_dataset with --ddad_processed_root supports only "
+                "--exp=depth_original or --exp=depth_postfusion_only."
+            )
+        if int(args.batch_size) != 1:
+            raise ValueError("--multi_dataset with DDAD requires --batch_size=1.")
+        if args.nuscenes_processed_root:
+            raise ValueError("Use either --ddad_processed_root or --nuscenes_processed_root, not both.")
+        kitti = _build_kitti_dataset(args, split)
+        ddad = _build_ddad_dataset(args, split)
+        dataset = ConcatDataset([kitti, ddad])
+        length = (
+            int(args.iters_per_epoch)
+            if split == "train" and int(args.iters_per_epoch) > 0
+            else None
+        )
+        return FixedLengthDataset(dataset, length=length) if length is not None else dataset
 
     if args.exp not in (
         "bevdetocc_lidar",
@@ -540,6 +601,17 @@ def _build_eval_loaders(args) -> Dict[str, DataLoader]:
         dataset = _build_dataset(args, "val")
         return {"kitti": _build_loader(args, dataset, train=False)}
 
+    if _multi_dataset_with_ddad(args):
+        val_limit = int(args.val_iters) if int(args.val_iters) > 0 else 0
+        datasets = {
+            "kitti": _build_kitti_dataset(args, "val"),
+            "ddad": _build_ddad_dataset(args, "val"),
+        }
+        return {
+            name: _build_loader(args, _limit_dataset(dataset, val_limit), train=False)
+            for name, dataset in datasets.items()
+        }
+
     val_limit = int(args.val_iters) if int(args.val_iters) > 0 else 0
     kitti_weight, nuscenes_weight = _parse_dataset_ratio(args.dataset_ratio)
     datasets = {}
@@ -555,6 +627,16 @@ def _build_eval_loaders(args) -> Dict[str, DataLoader]:
 
 def _collate_fn(args):
     if bool(getattr(args, "multi_dataset", False)):
+        if _multi_dataset_with_ddad(args):
+            if args.exp == "depth_original":
+                return collate_stage1_dense_depth
+            if args.exp == "depth_postfusion_only":
+                return collate_stage1_lidar_dense_depth
+            raise ValueError(
+                "KITTI+DDAD multi-dataset collate supports only depth_original "
+                "or depth_postfusion_only."
+            )
+
         def _collate_multi(batch):
             names = [b.get("dataset_name", "kitti") for b in batch]
             if any(n != names[0] for n in names):
@@ -824,7 +906,7 @@ def _make_optimizer(model: nn.Module, args) -> torch.optim.Optimizer | None:
     trainable_params = [p for _, p in named_trainable]
     if not trainable_params:
         return None
-    if bool(getattr(args, "multi_dataset", False)):
+    if bool(getattr(args, "multi_dataset", False)) and not _multi_dataset_with_ddad(args):
         base_params = []
         head_params = []
         classifier_params = []
@@ -1484,7 +1566,8 @@ def _flatten_eval_stats(eval_stats: Dict[str, Dict]) -> Dict:
 
 
 def _adjust_lr(optimizer, epoch_f: float, args) -> float:
-    base_lr = float(getattr(args, "base_lr", args.lr)) if bool(getattr(args, "multi_dataset", False)) else float(args.lr)
+    use_multidataset_base_lr = bool(getattr(args, "multi_dataset", False)) and not _multi_dataset_with_ddad(args)
+    base_lr = float(getattr(args, "base_lr", args.lr)) if use_multidataset_base_lr else float(args.lr)
     if epoch_f < args.warmup_epochs:
         lr = base_lr * epoch_f / max(args.warmup_epochs, 1)
     else:
@@ -1761,6 +1844,20 @@ def main():
     args.freeze_backbone_epochs = int(args.freeze_backbone_epochs)
     if args.freeze_backbone_epochs < 0:
         raise ValueError("--freeze_backbone_epochs must be >= 0.")
+    if args.ddad_processed_root and not args.multi_dataset:
+        raise ValueError("--ddad_processed_root requires --multi_dataset.")
+    if _multi_dataset_with_ddad(args):
+        if args.nuscenes_processed_root:
+            raise ValueError("Use either --ddad_processed_root or --nuscenes_processed_root, not both.")
+        if args.exp not in ("depth_original", "depth_postfusion_only"):
+            raise ValueError(
+                "--multi_dataset with --ddad_processed_root supports only "
+                "--exp=depth_original or --exp=depth_postfusion_only."
+            )
+        if int(args.batch_size) != 1:
+            raise ValueError("--multi_dataset with DDAD requires --batch_size=1.")
+        if args.exp == "depth_postfusion_only" and not args.ddad_raw_root:
+            raise ValueError("--ddad_raw_root is required for DDAD depth_postfusion_only.")
     if args.backbone == "da3" and args.exp not in ("depth_original", "depth_postfusion_only"):
         raise ValueError(
             "--backbone da3 is currently wired for --exp depth_original "
@@ -1884,6 +1981,11 @@ def main():
             f"[depth-only] dense metric depth loss weight={args.dense_depth_loss_weight} "
             f"features={args.dense_depth_features}"
         )
+        if _multi_dataset_with_ddad(args):
+            print(
+                "[multi_dataset] KITTI+DDAD depth concat; "
+                f"ddad_processed_root={args.ddad_processed_root}"
+            )
         if args.exp == "depth_postfusion_only":
             print("[fusion] attn_type=cross (depth-only post-fusion branch)")
         if args.exp == "depth_promptfusion_only":

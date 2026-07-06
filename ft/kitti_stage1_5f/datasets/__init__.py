@@ -23,6 +23,10 @@ from .kitti_stage1_lidar_dense_depth import (
     collate_stage1_dense_depth,
     collate_stage1_lidar_dense_depth,
 )
+from .ddad_stage1 import (
+    DDAD5FrameStage1DenseDepthDataset,
+    DDAD5FrameStage1LidarDenseDepthDataset,
+)
 from .nuscenes_stage1 import (
     NuScenes5FrameStage1LidarDataset,
     collate_stage1_nuscenes_lidar,
@@ -48,6 +52,8 @@ __all__ = [
     "collate_stage1_mono_lidar",
     "Kitti5FrameStage1DenseDepthDataset",
     "Kitti5FrameStage1LidarDenseDepthDataset",
+    "DDAD5FrameStage1DenseDepthDataset",
+    "DDAD5FrameStage1LidarDenseDepthDataset",
     "collate_stage1_dense_depth",
     "collate_stage1_lidar_dense_depth",
     "NuScenes5FrameStage1LidarDataset",

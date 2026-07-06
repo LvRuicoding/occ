@@ -7,6 +7,10 @@ Examples:
   python -m ft.kitti_stage1_5f.tools.eval_pointmap_depth \
     --ckpt output/kitti_stage1_5f_4gpu_pointmap_postfusion_only
 
+  python -m ft.kitti_stage1_5f.tools.eval_pointmap_depth \
+    --ckpt output/kitti_ddad_stage1_5f_4gpu_depth_original/checkpoint-last.pth \
+    --eval_dataset ddad
+
 Only ``--ckpt`` is required. Dataset/model settings are restored from the
 checkpoint args. By default this script evaluates model ``dense_depth`` output;
 legacy pointmap-z evaluation requires ``--depth_source pointmap``.
@@ -52,7 +56,8 @@ from ft.kitti_stage1_5f.models import (
     Stage1SSCBEVDetOccLidarPointmapDenseDepthModel,
 )
 from ft.kitti_stage1_5f.tools.train import (
-    _build_dataset,
+    _build_ddad_dataset,
+    _build_kitti_dataset,
     _build_loader,
     _model_forward,
     _state_dict_hash,
@@ -83,6 +88,17 @@ def get_args_parser() -> argparse.ArgumentParser:
         type=str,
         help="Checkpoint file, or an experiment directory containing checkpoint-last.pth.",
     )
+    p.add_argument(
+        "--eval_dataset",
+        choices=["kitti", "ddad"],
+        default="kitti",
+        help="Validation dataset to evaluate. Paths are restored from checkpoint args unless overridden.",
+    )
+    p.add_argument("--processed_root", default=None, type=str, help="Override KITTI processed root.")
+    p.add_argument("--ddad_processed_root", default=None, type=str, help="Override DDAD processed root.")
+    p.add_argument("--ddad_raw_root", default=None, type=str, help="Override DDAD raw root.")
+    p.add_argument("--occany_ckpt", default=None, type=str, help="Override OccAny backbone checkpoint path.")
+    p.add_argument("--velodyne_root", default=None, type=str, help="Override/deprecated KITTI velodyne root.")
     p.add_argument("--device", default="auto", type=str)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
@@ -147,9 +163,11 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args) -> None:
             f"eval_pointmap_depth supports {SUPPORTED_EXPS}, got checkpoint exp={args.exp!r}."
         )
 
-    args.processed_root = _ckpt_arg(ckpt_args, "processed_root", None)
-    args.occany_ckpt = _ckpt_arg(ckpt_args, "occany_ckpt", None)
-    args.velodyne_root = _ckpt_arg(ckpt_args, "velodyne_root", None)
+    args.processed_root = _override_or_ckpt(args, ckpt_args, "processed_root", None)
+    args.ddad_processed_root = _override_or_ckpt(args, ckpt_args, "ddad_processed_root", None)
+    args.ddad_raw_root = _override_or_ckpt(args, ckpt_args, "ddad_raw_root", None)
+    args.occany_ckpt = _override_or_ckpt(args, ckpt_args, "occany_ckpt", None)
+    args.velodyne_root = _override_or_ckpt(args, ckpt_args, "velodyne_root", None)
     args.width = int(_ckpt_arg(ckpt_args, "width", 512))
     args.height = int(_ckpt_arg(ckpt_args, "height", 160))
     args.num_frames = int(_ckpt_arg(ckpt_args, "num_frames", 5))
@@ -176,6 +194,19 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args) -> None:
 
     if not args.processed_root:
         raise ValueError("Checkpoint args do not contain processed_root.")
+    if args.eval_dataset == "ddad" and not args.ddad_processed_root:
+        raise ValueError(
+            "DDAD evaluation requires ddad_processed_root in the checkpoint or "
+            "an explicit --ddad_processed_root."
+        )
+    if args.eval_dataset == "ddad" and args.exp not in (
+        "depth_original",
+        "depth_postfusion_only",
+    ):
+        raise ValueError(
+            "--eval_dataset ddad is supported only for depth_original or "
+            "depth_postfusion_only checkpoints."
+        )
     if not args.occany_ckpt:
         raise ValueError("Checkpoint args do not contain occany_ckpt.")
 
@@ -790,6 +821,14 @@ def evaluate_depth(model, loader, device: torch.device, args: argparse.Namespace
     return accum.state_dict(), n_batches, output_info
 
 
+def _build_eval_dataset(args: argparse.Namespace):
+    if args.eval_dataset == "kitti":
+        return _build_kitti_dataset(args, "val")
+    if args.eval_dataset == "ddad":
+        return _build_ddad_dataset(args, "val")
+    raise ValueError(f"Unsupported eval_dataset={args.eval_dataset!r}.")
+
+
 def _build_eval_loader(args: argparse.Namespace, dataset):
     if not bool(getattr(args, "distributed", False)):
         return _build_loader(args, dataset, train=False), len(dataset)
@@ -841,7 +880,7 @@ def main() -> None:
 
     model = _build_depth_eval_model(args, device)
     missing_count, unexpected_count = _load_eval_weights(model, ckpt)
-    val_dataset = _build_dataset(args, "val")
+    val_dataset = _build_eval_dataset(args)
     val_loader, rank_samples = _build_eval_loader(args, val_dataset)
 
     backbone_hash = (
@@ -854,6 +893,7 @@ def main() -> None:
         print(
             f"[depth-eval] exp={args.exp} backbone={getattr(args, 'backbone', 'must3r')} "
             f"device={device} amp={args.amp} "
+            f"eval_dataset={args.eval_dataset} "
             f"val_samples={len(val_dataset)} rank0_samples={rank_samples} "
             f"world_size={misc.get_world_size()} batch_size={args.batch_size}"
         )
@@ -891,6 +931,7 @@ def main() -> None:
     result = {
         "ckpt": str(ckpt_path),
         "exp": args.exp,
+        "eval_dataset": args.eval_dataset,
         "elapsed": elapsed,
         "amp": args.amp,
         "batch_size": int(args.batch_size),
@@ -907,7 +948,12 @@ def main() -> None:
     result_safe = _json_safe(result)
     _print_metrics(result_safe)
 
-    out_path = Path(args.output_json) if args.output_json else ckpt_path.parent / "depth_metrics.json"
+    if args.output_json:
+        out_path = Path(args.output_json)
+    elif args.eval_dataset == "kitti":
+        out_path = ckpt_path.parent / "depth_metrics.json"
+    else:
+        out_path = ckpt_path.parent / f"depth_metrics_{args.eval_dataset}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(result_safe, f, indent=2, sort_keys=True)
