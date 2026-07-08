@@ -73,6 +73,11 @@ from ..datasets import (
     evaluate_lidar_det_ap40,
 )
 from ..datasets.unified_occ import NUSCENES_TO_UNIFIED
+from ..datasets.kitti_object_det import (
+    KITTI_OBJECT_DET_DEPTH_BOUND,
+    KITTI_OBJECT_DET_PC_RANGE,
+    make_kitti_object_det_grid_config,
+)
 from ..losses_monoscene import MonoSceneSSCLoss
 from ..models import (
     Stage1DepthOriginalModel,
@@ -307,8 +312,14 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
     p.add_argument("--det_score_threshold", type=float, default=0.05,
                    help="Score threshold used by the local CenterHead decoder for detection eval.")
+    p.add_argument("--det_pc_range", nargs=6, type=float, default=KITTI_OBJECT_DET_PC_RANGE,
+                   metavar=("X_MIN", "Y_MIN", "Z_MIN", "X_MAX", "Y_MAX", "Z_MAX"),
+                   help="KITTI Object DET-only LiDAR pc_range. Other experiments keep their dataset grid.")
+    p.add_argument("--det_depth_bound", nargs=3, type=float, default=KITTI_OBJECT_DET_DEPTH_BOUND,
+                   metavar=("START", "END", "STEP"),
+                   help="KITTI Object DET-only LSS depth bins used for lifting/depth supervision.")
     p.add_argument("--depth_supervision", action=argparse.BooleanOptionalAction, default=True,
-                   help="Enable BEVDet-style sparse LiDAR depth supervision for BEVDet-OCC LiDAR variants.")
+                   help="Enable BEVDet-style sparse LiDAR depth supervision for BEVDet-OCC LiDAR and DET variants.")
     p.add_argument("--depth_loss_weight", type=float, default=0.05,
                    help="Weight for BEVDet-style LSS depth loss when --depth_supervision is enabled.")
     p.add_argument("--dense_depth_supervision", action=argparse.BooleanOptionalAction, default=True,
@@ -464,6 +475,7 @@ def _build_kitti_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
             frame_stride=args.frame_stride,
             output_resolution=(args.width, args.height),
             max_points_per_sweep=args.max_points_per_sweep,
+            grid_config=make_kitti_object_det_grid_config(tuple(args.det_pc_range)),
         )
     common = dict(
         processed_root=args.processed_root,
@@ -1107,6 +1119,7 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             batch["T_cam_from_velo"].to(device, non_blocking=True),
             batch["K_per_frame"].to(device, non_blocking=True),
             batch["image_hw"].to(device, non_blocking=True),
+            return_depth=bool(getattr(args, "depth_supervision", False)),
             grid_config=grid_config,
         )
     if args.exp == "pointmap_original":
@@ -1168,11 +1181,13 @@ def _maybe_add_bevdet_depth_loss(
     out: Dict,
     args,
 ) -> tuple[torch.Tensor, Dict[str, float]]:
-    if args.exp not in BEVDETOCC_LIDAR_EXPS or not bool(getattr(args, "depth_supervision", False)):
+    if args.exp not in (*BEVDETOCC_LIDAR_EXPS, *DET_EXPS) or not bool(
+        getattr(args, "depth_supervision", False)
+    ):
         return loss, details
     if "depth_logits" not in out or "gt_depth" not in out:
         raise RuntimeError(
-            "BEVDetOcc depth supervision expected model output to contain "
+            "BEVDet-style depth supervision expected model output to contain "
             "'depth_logits' and 'gt_depth'."
         )
     depth_weighted, depth_raw, depth_valid = bevdet_depth_loss(
@@ -1688,6 +1703,7 @@ def train_one_epoch(
                     gt_boxes,
                     gt_labels,
                 )
+                loss, details = _maybe_add_bevdet_depth_loss(loss, details, out, args)
             elif args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, details = criterion(out, target, cp)
@@ -1798,6 +1814,7 @@ def eval_one_epoch(
                     gt_boxes,
                     gt_labels,
                 )
+                loss, _details = _maybe_add_bevdet_depth_loss(loss, _details, out, args)
                 logits = None
             elif args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
@@ -2092,6 +2109,8 @@ def main():
         model_kwargs["freeze_backbone"] = args.freeze_backbone
         model_kwargs["backbone"] = args.backbone
         model_kwargs["det_score_threshold"] = args.det_score_threshold
+        model_kwargs["det_pc_range"] = tuple(args.det_pc_range)
+        model_kwargs["depth_bound"] = tuple(args.det_depth_bound)
         if args.exp == "det_postfusion_only":
             model_kwargs["fusion_attn_type"] = "cross"
     if args.exp in ("pointmap_original", "depth_original", "depth_promptfusion_only"):
@@ -2183,6 +2202,14 @@ def main():
         print(
             f"[det] frame_stride={args.frame_stride} num_frames={args.num_frames} "
             f"score_thr={args.det_score_threshold}"
+        )
+        print(
+            f"[det] pc_range={tuple(float(v) for v in args.det_pc_range)} "
+            f"half_grid={model.half_grid_size} depth_bound={tuple(float(v) for v in args.det_depth_bound)}"
+        )
+        print(
+            f"[depth_supervision] enabled={args.depth_supervision} "
+            f"weight={args.depth_loss_weight}"
         )
         if args.exp == "det_postfusion_only":
             print("[fusion] attn_type=cross (detection post-fusion branch)")
@@ -2481,6 +2508,7 @@ def main():
                     keep_payload = {
                         "model": ckpt_payload["model"],
                         "epoch": epoch,
+                        "args": vars(args),
                         "backbone_hash": backbone_hash,
                     }
                 else:

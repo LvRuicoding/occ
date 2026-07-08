@@ -14,11 +14,69 @@ from occany.utils.helpers import crop_resize_if_necessary
 from occany.utils.image_util import ImgNorm
 
 from .kitti_stage1 import _T_cami_from_cam0
-from .unified_occ import KITTI_GRID_CONFIG
+from .unified_occ import KITTI_GRID_CONFIG, GridConfig
 
 
 KITTI_OBJECT_CLASS_NAMES: Tuple[str, ...] = ("Car", "Pedestrian", "Cyclist")
 KITTI_OBJECT_NAME_TO_LABEL = {name: i for i, name in enumerate(KITTI_OBJECT_CLASS_NAMES)}
+KITTI_OBJECT_LEGACY_DET_PC_RANGE: Tuple[float, float, float, float, float, float] = (
+    0.0,
+    -25.6,
+    -2.0,
+    51.2,
+    25.6,
+    4.4,
+)
+KITTI_OBJECT_DET_PC_RANGE: Tuple[float, float, float, float, float, float] = (
+    0.0,
+    -40.0,
+    -3.0,
+    70.4,
+    40.0,
+    3.4,
+)
+KITTI_OBJECT_DET_VOXEL_SIZE: Tuple[float, float, float] = (0.4, 0.4, 0.4)
+KITTI_OBJECT_LEGACY_DET_DEPTH_BOUND: Tuple[float, float, float] = (1.0, 52.0, 0.4)
+KITTI_OBJECT_DET_DEPTH_BOUND: Tuple[float, float, float] = (1.0, 80.0, 0.4)
+
+
+def _grid_dim(span: float, voxel: float, name: str) -> int:
+    dim = int(round(float(span) / float(voxel)))
+    if dim <= 0 or abs(dim * float(voxel) - float(span)) > 1e-4:
+        raise ValueError(f"{name} span={span:g} must be divisible by voxel={voxel:g}.")
+    return dim
+
+
+def make_kitti_object_det_grid_config(
+    pc_range: Tuple[float, float, float, float, float, float] = KITTI_OBJECT_DET_PC_RANGE,
+    voxel_size: Tuple[float, float, float] = KITTI_OBJECT_DET_VOXEL_SIZE,
+) -> GridConfig:
+    x_min, y_min, z_min, x_max, y_max, z_max = (float(v) for v in pc_range)
+    vx, vy, vz = (float(v) for v in voxel_size)
+    if not (x_max > x_min and y_max > y_min and z_max > z_min):
+        raise ValueError(f"Invalid detection pc_range={pc_range!r}.")
+
+    half_grid = (
+        _grid_dim(x_max - x_min, vx, "x"),
+        _grid_dim(y_max - y_min, vy, "y"),
+        _grid_dim(z_max - z_min, vz, "z"),
+    )
+    full_size = (vx * 0.5, vy * 0.5, vz * 0.5)
+    full_grid = tuple(int(v) * 2 for v in half_grid)
+    return GridConfig(
+        dataset_name="kitti_object_det",
+        full_grid_size=full_grid,
+        full_voxel_origin=(x_min, y_min, z_min),
+        full_voxel_size=full_size,
+        half_grid_size=half_grid,
+        half_voxel_origin=(x_min, y_min, z_min),
+        half_voxel_size=(vx, vy, vz),
+        # LidarImageFusionModule voxelizes in camera coords:
+        # x_cam right ~= y_lidar, y_cam down ~= z_lidar, z_cam forward ~= x_lidar.
+        fusion_vox_origin=(y_min, z_min, x_min),
+        fusion_vox_size=(vy, vz, vx),
+        fusion_vox_grid=(half_grid[1], half_grid[2], half_grid[0]),
+    )
 
 
 def _normalize_angle(angle: float) -> float:
@@ -83,6 +141,7 @@ class KittiObject5FrameDetDataset(Dataset):
         output_resolution: Tuple[int, int] = (512, 160),
         max_points_per_sweep: int = 0,
         train_count: int = 3712,
+        grid_config: GridConfig | None = None,
     ) -> None:
         super().__init__()
         if split not in ("train", "val", "trainval"):
@@ -94,7 +153,7 @@ class KittiObject5FrameDetDataset(Dataset):
         self.output_resolution = (int(output_resolution[0]), int(output_resolution[1]))
         self.max_points_per_sweep = int(max_points_per_sweep)
         self.class_names = KITTI_OBJECT_CLASS_NAMES
-        self.grid_config = KITTI_GRID_CONFIG
+        self.grid_config = grid_config if grid_config is not None else KITTI_GRID_CONFIG
 
         mapping_path = osp.join(root, "mapping", "train_mapping.txt")
         rand_path = osp.join(root, "mapping", "train_rand.txt")

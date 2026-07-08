@@ -13,6 +13,34 @@ from .stage1_pointmap_ablation import _make_recon_backbone
 from .stage1_ssc_bevdetocc_lidar import LSSDepthLift, OccAnyTokenProjector
 
 
+DEFAULT_DET_PC_RANGE: Tuple[float, float, float, float, float, float] = (
+    0.0,
+    -40.0,
+    -3.0,
+    70.4,
+    40.0,
+    3.4,
+)
+DEFAULT_DET_VOXEL_SIZE: Tuple[float, float, float] = (0.4, 0.4, 0.4)
+DEFAULT_DET_DEPTH_BOUND: Tuple[float, float, float] = (1.0, 80.0, 0.4)
+
+
+def _grid_size_from_range(
+    pc_range: Tuple[float, float, float, float, float, float],
+    voxel_size: Tuple[float, float, float],
+) -> Tuple[int, int, int]:
+    dims: List[int] = []
+    for axis, start, end, voxel in zip("xyz", pc_range[:3], pc_range[3:], voxel_size):
+        span = float(end) - float(start)
+        dim = int(round(span / float(voxel)))
+        if dim <= 0 or abs(dim * float(voxel) - span) > 1e-4:
+            raise ValueError(
+                f"Detection {axis} span={span:g} must be divisible by voxel={float(voxel):g}."
+            )
+        dims.append(dim)
+    return tuple(dims)  # type: ignore[return-value]
+
+
 def conv_bn_relu_2d(
     c_in: int,
     c_out: int,
@@ -197,7 +225,7 @@ class SimpleCenterHead(nn.Module):
         self,
         in_channels: int = 256,
         num_classes: int = 3,
-        pc_range: Tuple[float, float, float, float, float, float] = (0.0, -25.6, -2.0, 51.2, 25.6, 4.4),
+        pc_range: Tuple[float, float, float, float, float, float] = DEFAULT_DET_PC_RANGE,
         voxel_size: Tuple[float, float] = (0.4, 0.4),
         max_objs: int = 100,
         score_threshold: float = 0.05,
@@ -395,9 +423,9 @@ class _Stage1DetBaseModel(nn.Module):
         num_frames: int = 5,
         freeze_backbone: bool = False,
         backbone: str = "must3r",
-        fusion_vox_origin: Tuple[float, float, float] = (-25.6, -2.0, 0.0),
-        fusion_vox_size: Tuple[float, float, float] = (0.4, 0.4, 0.4),
-        fusion_vox_grid: Tuple[int, int, int] = (128, 16, 128),
+        fusion_vox_origin: Optional[Tuple[float, float, float]] = None,
+        fusion_vox_size: Optional[Tuple[float, float, float]] = None,
+        fusion_vox_grid: Optional[Tuple[int, int, int]] = None,
         fusion_num_heads: int = 8,
         fusion_window: int = 4,
         fusion_d_voxel: int = 128,
@@ -405,7 +433,9 @@ class _Stage1DetBaseModel(nn.Module):
         fusion_attn_type: str = "cross",
         lss_in_channels: int = 256,
         lss_out_channels: int = 32,
-        depth_bound: Tuple[float, float, float] = (1.0, 52.0, 0.4),
+        depth_bound: Tuple[float, float, float] = DEFAULT_DET_DEPTH_BOUND,
+        det_pc_range: Tuple[float, float, float, float, float, float] = DEFAULT_DET_PC_RANGE,
+        det_voxel_size: Tuple[float, float, float] = DEFAULT_DET_VOXEL_SIZE,
         det_score_threshold: float = 0.05,
         **_unused,
     ) -> None:
@@ -416,7 +446,26 @@ class _Stage1DetBaseModel(nn.Module):
         self.num_frames = int(num_frames)
         self.freeze_backbone = bool(freeze_backbone)
         self.use_lidar_fusion = bool(use_lidar_fusion)
-        self.half_grid_size = (128, 128, 16)
+        self.det_pc_range = tuple(float(v) for v in det_pc_range)
+        self.det_voxel_size = tuple(float(v) for v in det_voxel_size)
+        self.half_grid_size = _grid_size_from_range(self.det_pc_range, self.det_voxel_size)
+        self.half_voxel_origin = self.det_pc_range[:3]
+        self.depth_bound = tuple(float(v) for v in depth_bound)
+        fusion_vox_origin = (
+            (self.det_pc_range[1], self.det_pc_range[2], self.det_pc_range[0])
+            if fusion_vox_origin is None
+            else tuple(float(v) for v in fusion_vox_origin)
+        )
+        fusion_vox_size = (
+            (self.det_voxel_size[1], self.det_voxel_size[2], self.det_voxel_size[0])
+            if fusion_vox_size is None
+            else tuple(float(v) for v in fusion_vox_size)
+        )
+        fusion_vox_grid = (
+            (self.half_grid_size[1], self.half_grid_size[2], self.half_grid_size[0])
+            if fusion_vox_grid is None
+            else tuple(int(v) for v in fusion_vox_grid)
+        )
         self.backbone = _make_recon_backbone(
             backbone=backbone,
             img_size=backbone_img_size,
@@ -451,9 +500,9 @@ class _Stage1DetBaseModel(nn.Module):
         self.lss = LSSDepthLift(
             in_channels=lss_in_channels,
             out_channels=lss_out_channels,
-            depth_bound=depth_bound,
-            voxel_origin=(0.0, -25.6, -2.0),
-            voxel_size=(0.4, 0.4, 0.4),
+            depth_bound=self.depth_bound,
+            voxel_origin=self.half_voxel_origin,
+            voxel_size=self.det_voxel_size,
             grid_size=self.half_grid_size,
         )
         self.volume_to_bev = conv_bn_relu_2d(lss_out_channels * self.half_grid_size[2], 64)
@@ -462,6 +511,8 @@ class _Stage1DetBaseModel(nn.Module):
         self.det_head = SimpleCenterHead(
             in_channels=256,
             num_classes=3,
+            pc_range=self.det_pc_range,
+            voxel_size=self.det_voxel_size[:2],
             score_threshold=float(det_score_threshold),
         )
 
@@ -525,7 +576,7 @@ class _Stage1DetBaseModel(nn.Module):
         return_depth: bool = False,
         grid_config: Optional[Dict[str, torch.Tensor | Tuple[int, int, int]]] = None,
     ) -> Dict[str, torch.Tensor]:
-        del T_target_from_refcam, gt_depth, return_depth
+        del T_target_from_refcam
         if T_cam_from_velo is None or K_per_frame is None or image_hw is None:
             raise RuntimeError("Detection models require T_cam_from_velo, K_per_frame and image_hw.")
         backbone_out = self.backbone(views)
@@ -574,11 +625,12 @@ class _Stage1DetBaseModel(nn.Module):
             B,
         )
         T_cam = T_cam_from_velo.to(device=feat_2d.device)
-        lss_volume, _depth_logits = self.lss(
+        lss_volume, depth_logits = self.lss(
             feat_2d=feat_2d,
             K_per_frame=K_per_frame.to(device=feat_2d.device),
             T_cam_from_velo=T_cam,
             image_hw=image_hw.to(device=feat_2d.device),
+            gt_depth=gt_depth,
             voxel_origin=half_origin,
             voxel_size=half_size,
             grid_size=half_grid,
@@ -591,7 +643,27 @@ class _Stage1DetBaseModel(nn.Module):
         bev = vol.permute(0, 1, 4, 2, 3).reshape(B, C * Z, X, Y)
         bev = self.volume_to_bev(bev)
         bev = self.bev_neck(self.bev_backbone(bev))
-        return {"det_preds": self.det_head(bev), "bev_feat": bev}
+        out: Dict[str, torch.Tensor] = {"det_preds": self.det_head(bev), "bev_feat": bev}
+        if return_depth:
+            if points_per_frame is None:
+                raise RuntimeError("Detection depth supervision requires points_per_frame.")
+            if gt_depth is None:
+                gt_depth = self.lss.build_depth_target(
+                    points_per_frame=points_per_frame,
+                    K_per_frame=K_per_frame,
+                    T_cam_from_velo=T_cam_from_velo,
+                    image_hw=image_hw,
+                    H_t=depth_logits.shape[-2],
+                    W_t=depth_logits.shape[-1],
+                    device=depth_logits.device,
+                )
+            out.update(
+                depth_logits=depth_logits,
+                gt_depth=gt_depth.to(device=depth_logits.device, dtype=torch.float32),
+                depth_start=self.lss.depth_start,
+                depth_step=self.lss.depth_step,
+            )
+        return out
 
     def det_loss(
         self,

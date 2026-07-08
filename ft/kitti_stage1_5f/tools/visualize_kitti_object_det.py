@@ -33,7 +33,10 @@ from ft.kitti_stage1_5f.datasets import (
     KittiObject5FrameDetDataset,
     collate_kitti_object_det,
 )
-from ft.kitti_stage1_5f.datasets.kitti_object_det import _parse_object_calib
+from ft.kitti_stage1_5f.datasets.kitti_object_det import (
+    _parse_object_calib,
+    make_kitti_object_det_grid_config,
+)
 from ft.kitti_stage1_5f.tools.eval_kitti_object_det import (
     _build_model,
     _fill_args_from_checkpoint,
@@ -73,6 +76,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="auto", type=str)
     p.add_argument("--amp", choices=["bf16", "fp16", "none"], default=None)
     p.add_argument("--score_threshold", default=None, type=float, help="Override decode score threshold.")
+    p.add_argument("--det_pc_range", nargs=6, type=float, default=None,
+                   metavar=("X_MIN", "Y_MIN", "Z_MIN", "X_MAX", "Y_MAX", "Z_MAX"),
+                   help="Override checkpoint KITTI Object DET pc_range.")
+    p.add_argument("--det_depth_bound", nargs=3, type=float, default=None,
+                   metavar=("START", "END", "STEP"),
+                   help="Override checkpoint KITTI Object DET LSS depth bound.")
     p.add_argument("--max_points_per_sweep", default=None, type=int)
     p.add_argument("--max-preds", default=50, type=int, help="Maximum predictions to draw after score sorting; <=0 draws all.")
     p.add_argument("--point-stride", default=3, type=int, help="Stride used when plotting LiDAR points in BEV.")
@@ -101,6 +110,7 @@ def _build_dataset(args: argparse.Namespace) -> KittiObject5FrameDetDataset:
         frame_stride=args.frame_stride,
         output_resolution=(args.width, args.height),
         max_points_per_sweep=args.max_points_per_sweep,
+        grid_config=make_kitti_object_det_grid_config(tuple(args.det_pc_range)),
     )
 
 
@@ -234,8 +244,8 @@ def _plot_bev(
     gt_labels: torch.Tensor,
     pred: dict,
     point_stride: int,
+    pc_range: Tuple[float, float, float, float, float, float],
 ) -> None:
-    pc_range = (0.0, -25.6, -2.0, 51.2, 25.6, 4.4)
     pts = points.detach().cpu().numpy()
     keep = (
         (pts[:, 0] >= pc_range[0])
@@ -367,6 +377,7 @@ def main() -> None:
         sample["gt_labels_3d"],
         pred,
         point_stride=args.point_stride,
+        pc_range=tuple(args.det_pc_range),
     )
 
     if args.output is None:
@@ -388,6 +399,8 @@ def main() -> None:
         "gt_count": int(sample["gt_bboxes_3d"].shape[0]),
         "pred_count": int(pred["boxes_3d"].shape[0]),
         "score_threshold": float(args.det_score_threshold),
+        "det_pc_range": [float(v) for v in args.det_pc_range],
+        "det_depth_bound": [float(v) for v in args.det_depth_bound],
         "load_missing_keys": len(status.missing_keys),
         "load_unexpected_keys": len(status.unexpected_keys),
         "predictions": _prediction_rows(pred),

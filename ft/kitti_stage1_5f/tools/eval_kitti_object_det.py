@@ -43,8 +43,11 @@ from ft.kitti_stage1_5f.datasets import (
     collate_kitti_object_det,
 )
 from ft.kitti_stage1_5f.datasets.kitti_object_det import (
+    KITTI_OBJECT_LEGACY_DET_DEPTH_BOUND,
+    KITTI_OBJECT_LEGACY_DET_PC_RANGE,
     _normalize_angle,
     _parse_object_calib,
+    make_kitti_object_det_grid_config,
 )
 from ft.kitti_stage1_5f.kitti_object_official_eval import kitti_object_eval
 from ft.kitti_stage1_5f.models import (
@@ -74,6 +77,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_workers", default=None, type=int)
     p.add_argument("--amp", choices=["bf16", "fp16", "none"], default=None)
     p.add_argument("--score_threshold", default=None, type=float, help="Override decode score threshold.")
+    p.add_argument("--det_pc_range", nargs=6, type=float, default=None,
+                   metavar=("X_MIN", "Y_MIN", "Z_MIN", "X_MAX", "Y_MAX", "Z_MAX"),
+                   help="Override checkpoint KITTI Object DET pc_range.")
+    p.add_argument("--det_depth_bound", nargs=3, type=float, default=None,
+                   metavar=("START", "END", "STEP"),
+                   help="Override checkpoint KITTI Object DET LSS depth bound.")
     p.add_argument("--max_points_per_sweep", default=None, type=int)
     p.add_argument("--max_batches", default=0, type=int, help="Debug only; 0 evaluates full val set.")
     p.add_argument("--print_freq", default=20, type=int)
@@ -152,6 +161,24 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args) -> None:
         if args.score_threshold is not None
         else float(_ckpt_arg(ckpt_args, "det_score_threshold", 0.05))
     )
+    args.det_pc_range = tuple(
+        float(v)
+        for v in _override_or_ckpt(
+            args,
+            ckpt_args,
+            "det_pc_range",
+            KITTI_OBJECT_LEGACY_DET_PC_RANGE,
+        )
+    )
+    args.det_depth_bound = tuple(
+        float(v)
+        for v in _override_or_ckpt(
+            args,
+            ckpt_args,
+            "det_depth_bound",
+            KITTI_OBJECT_LEGACY_DET_DEPTH_BOUND,
+        )
+    )
     args.max_points_per_sweep = int(
         args.max_points_per_sweep
         if args.max_points_per_sweep is not None
@@ -183,6 +210,8 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Mod
         freeze_backbone=args.freeze_backbone,
         backbone=args.backbone,
         det_score_threshold=args.det_score_threshold,
+        det_pc_range=args.det_pc_range,
+        depth_bound=args.det_depth_bound,
     )
     return model.to(device)
 
@@ -559,6 +588,7 @@ def _build_eval_dataset(args: argparse.Namespace) -> KittiObject5FrameDetDataset
         frame_stride=args.frame_stride,
         output_resolution=(args.width, args.height),
         max_points_per_sweep=args.max_points_per_sweep,
+        grid_config=make_kitti_object_det_grid_config(tuple(args.det_pc_range)),
     )
 
 
@@ -651,6 +681,10 @@ def main() -> None:
             f"[data] val samples={len(dataset)} rank0_samples={rank_samples} "
             f"world_size={misc.get_world_size()} batch_size={args.batch_size} "
             f"device={device} amp={args.amp} score_thr={args.det_score_threshold}"
+        )
+        print(
+            f"[det] pc_range={tuple(float(v) for v in args.det_pc_range)} "
+            f"depth_bound={tuple(float(v) for v in args.det_depth_bound)}"
         )
 
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else (torch.float16 if args.amp == "fp16" else None)
@@ -747,6 +781,8 @@ def main() -> None:
         "eval_backend": args.eval_backend,
         "eval_info": eval_info,
         "kitti_det_root": args.kitti_det_root,
+        "det_pc_range": [float(v) for v in args.det_pc_range],
+        "det_depth_bound": [float(v) for v in args.det_depth_bound],
         "num_samples": len(gt_annos),
         "elapsed_sec": time.time() - t0,
         "world_size": int(misc.get_world_size()),
