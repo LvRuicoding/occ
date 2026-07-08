@@ -31,6 +31,11 @@ from .stage1_pointmap_ablation import (
     Stage1PointmapPostFusionOnlyModel,
     Stage1SSCBEVDetOccLidarPointmapDenseDepthModel,
 )
+from .stage1_det import (
+    SimpleCenterHead,
+    Stage1DetOriginalModel,
+    Stage1DetPostFusionOnlyModel,
+)
 
 __all__ = [
     "OccAnyRecon5FrameBackbone",
@@ -47,9 +52,12 @@ __all__ = [
     "Stage1DepthOriginalModel",
     "Stage1DepthPostFusionOnlyModel",
     "Stage1DepthPromptFusionOnlyModel",
+    "Stage1DetOriginalModel",
+    "Stage1DetPostFusionOnlyModel",
     "Stage1PointmapOriginalModel",
     "Stage1PointmapPostFusionOnlyModel",
     "Stage1SSCBEVDetOccLidarPointmapDenseDepthModel",
+    "SimpleCenterHead",
     "SingleScaleDPTDepthHead",
     "PostFusionPointmapHead",
     "dense_metric_depth_loss",

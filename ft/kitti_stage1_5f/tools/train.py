@@ -52,6 +52,7 @@ from ..datasets import (
     DDAD5FrameStage1DenseDepthDataset,
     DDAD5FrameStage1LidarDenseDepthDataset,
     KITTI_SSC_CLASS_NAMES,
+    KITTI_OBJECT_CLASS_NAMES,
     UNIFIED_SSC_CLASS_NAMES,
     Kitti5FrameStage1DenseDepthDataset,
     Kitti5FrameStage1Dataset,
@@ -59,7 +60,9 @@ from ..datasets import (
     Kitti5FrameStage1LidarDataset,
     Kitti5FrameStage1MonoDataset,
     Kitti5FrameStage1MonoLidarDataset,
+    KittiObject5FrameDetDataset,
     NuScenes5FrameStage1LidarDataset,
+    collate_kitti_object_det,
     collate_stage1,
     collate_stage1_dense_depth,
     collate_stage1_lidar_dense_depth,
@@ -67,6 +70,7 @@ from ..datasets import (
     collate_stage1_mono,
     collate_stage1_mono_lidar,
     collate_stage1_nuscenes_lidar,
+    evaluate_lidar_det_ap40,
 )
 from ..datasets.unified_occ import NUSCENES_TO_UNIFIED
 from ..losses_monoscene import MonoSceneSSCLoss
@@ -74,6 +78,8 @@ from ..models import (
     Stage1DepthOriginalModel,
     Stage1DepthPostFusionOnlyModel,
     Stage1DepthPromptFusionOnlyModel,
+    Stage1DetOriginalModel,
+    Stage1DetPostFusionOnlyModel,
     Stage1SSCBEVDetOccLidarDenseDepthModel,
     Stage1SSCBEVDetOccLidarModel,
     Stage1SSCBEVDetOccLidarPointmapModel,
@@ -109,6 +115,10 @@ DEPTH_ONLY_EXPS = (
     "depth_promptfusion_only",
     "depth_original",
 )
+DET_EXPS = (
+    "det_original",
+    "det_postfusion_only",
+)
 POINTMAP_QUALITY_EXPS = (
     *POINTMAP_ONLY_EXPS,
     "bevdetocc_lidar_pointmap",
@@ -132,14 +142,21 @@ LIDAR_EXPS = (
     "pointmap_postfusion_only",
     "depth_postfusion_only",
     "depth_promptfusion_only",
+    "det_postfusion_only",
 )
 MONOSCENE_LOSS_EXPS = ("monoscene", "monoscene_lidar")
 
 
 def get_args_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("OccAny Stage-1 SSC fine-tune", add_help=True)
-    p.add_argument("--processed_root", required=True, type=str,
+    p.add_argument("--processed_root", default=None, type=str,
                    help="Path to data/kitti_processed.")
+    p.add_argument(
+        "--kitti_det_root",
+        default="/home/dataset-local/lr/code/OccAny/raw_data/OpenDataLab___KITTI_Object",
+        type=str,
+        help="Path to the KITTI Object root for detection experiments.",
+    )
     p.add_argument("--kittiodo_root", default=None, type=str,
                    help="Deprecated; calib.txt is read from processed_root/<split>_<seq>.")
     p.add_argument("--occany_ckpt", required=True, type=str,
@@ -230,6 +247,9 @@ def get_args_parser() -> argparse.ArgumentParser:
     #   - "depth_postfusion_only": 2D LiDAR fusion + DPT dense depth head only.
     #   - "depth_promptfusion_only": original reconstruction tokens + LiDAR
     #                         sparse-depth prompt injected into the DPT decoder.
+    #   - "det_original": reliable-history KITTI Object detection from target
+    #                         frame OccAny tokens + BEVDet/CenterHead backend.
+    #   - "det_postfusion_only": same detection backend after 2D LiDAR fusion.
     p.add_argument(
         "--exp",
         choices=[
@@ -245,6 +265,8 @@ def get_args_parser() -> argparse.ArgumentParser:
             "depth_original",
             "depth_postfusion_only",
             "depth_promptfusion_only",
+            "det_original",
+            "det_postfusion_only",
         ],
         default="light",
     )
@@ -283,6 +305,8 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="Optional JSON/list/tensor path for unified 27-class loss weights.")
     p.add_argument("--max_points_per_sweep", type=int, default=0,
                    help="If >0, deterministically stride-subsample each LiDAR sweep to this point count.")
+    p.add_argument("--det_score_threshold", type=float, default=0.05,
+                   help="Score threshold used by the local CenterHead decoder for detection eval.")
     p.add_argument("--depth_supervision", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable BEVDet-style sparse LiDAR depth supervision for BEVDet-OCC LiDAR variants.")
     p.add_argument("--depth_loss_weight", type=float, default=0.05,
@@ -432,6 +456,15 @@ def _multi_dataset_with_nuscenes(args) -> bool:
 
 
 def _build_kitti_dataset(args, split: str) -> Kitti5FrameStage1Dataset:
+    if args.exp in DET_EXPS:
+        return KittiObject5FrameDetDataset(
+            root=args.kitti_det_root,
+            split=split,
+            num_frames=args.num_frames,
+            frame_stride=args.frame_stride,
+            output_resolution=(args.width, args.height),
+            max_points_per_sweep=args.max_points_per_sweep,
+        )
     common = dict(
         processed_root=args.processed_root,
         split=split,
@@ -511,6 +544,9 @@ def _limit_dataset(dataset: Dataset, length: int) -> Dataset:
 def _build_dataset(args, split: str) -> Dataset:
     if not bool(getattr(args, "multi_dataset", False)):
         return _build_kitti_dataset(args, split)
+
+    if args.exp in DET_EXPS:
+        raise ValueError("Detection experiments do not support --multi_dataset.")
 
     if _multi_dataset_with_ddad(args):
         if args.exp not in ("depth_original", "depth_postfusion_only"):
@@ -626,6 +662,8 @@ def _build_eval_loaders(args) -> Dict[str, DataLoader]:
 
 
 def _collate_fn(args):
+    if args.exp in DET_EXPS:
+        return collate_kitti_object_det
     if bool(getattr(args, "multi_dataset", False)):
         if _multi_dataset_with_ddad(args):
             if args.exp == "depth_original":
@@ -965,7 +1003,7 @@ def _ensure_optimizer_matches_trainable(
 
 def _ddp_kwargs(args) -> Dict:
     kwargs = dict(device_ids=[args.gpu])
-    if args.exp in (*LIDAR_EXPS, *DEPTH_ONLY_EXPS) or int(args.freeze_backbone_epochs) > 0:
+    if args.exp in (*LIDAR_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS) or int(args.freeze_backbone_epochs) > 0:
         kwargs.update(find_unused_parameters=True, static_graph=False)
     else:
         kwargs.update(find_unused_parameters=False, static_graph=True)
@@ -1008,6 +1046,10 @@ def _move_points_to_device(
     ]
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
 def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
     """Dispatch the model forward to match each experiment's signature."""
     views = _move_views_to_device(batch["views"], device)
@@ -1048,6 +1090,16 @@ def _model_forward(model: nn.Module, batch: Dict, device: torch.device, args):
             grid_config=grid_config,
         )
     if args.exp == "depth_promptfusion_only":
+        return model(
+            views,
+            T_target_from_refcam,
+            _move_points_to_device(batch["points_per_frame"], device),
+            batch["T_cam_from_velo"].to(device, non_blocking=True),
+            batch["K_per_frame"].to(device, non_blocking=True),
+            batch["image_hw"].to(device, non_blocking=True),
+            grid_config=grid_config,
+        )
+    if args.exp in DET_EXPS:
         return model(
             views,
             T_target_from_refcam,
@@ -1610,7 +1662,7 @@ def train_one_epoch(
             _adjust_lr(optimizer, epoch_f, args)
 
         target = None
-        if args.exp not in (*POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS):
+        if args.exp not in (*POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS):
             target = batch["voxel_label"].to(device, non_blocking=True)
 
         amp_dtype = (
@@ -1628,6 +1680,14 @@ def train_one_epoch(
                 loss, details = _pointmap_only_loss(out, batch, args, is_train=True)
             elif args.exp in DEPTH_ONLY_EXPS:
                 loss, details = _dense_depth_only_loss(out, batch, args)
+            elif args.exp in DET_EXPS:
+                gt_boxes = [b.to(device=device, non_blocking=True) for b in batch["gt_bboxes_3d"]]
+                gt_labels = [l.to(device=device, non_blocking=True) for l in batch["gt_labels_3d"]]
+                loss, details = _unwrap_model(model).det_loss(
+                    out["det_preds"],
+                    gt_boxes,
+                    gt_labels,
+                )
             elif args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, details = criterion(out, target, cp)
@@ -1683,7 +1743,7 @@ def eval_one_epoch(
     dataset_name: str = "val",
 ):
     model.eval()
-    eval_ssc = args.exp not in (*POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS)
+    eval_ssc = args.exp not in (*POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS)
     ssc = None
     if eval_ssc:
         metric_names = (
@@ -1700,6 +1760,12 @@ def eval_one_epoch(
             valid_classes=_eval_valid_classes(dataset_name, args),
         )
     pointmap_accum = PointmapMetricAccumulator(args) if args.exp in POINTMAP_QUALITY_EXPS else None
+    det_gt_boxes: List[torch.Tensor] = []
+    det_gt_labels: List[torch.Tensor] = []
+    det_pred_boxes: List[torch.Tensor] = []
+    det_pred_scores: List[torch.Tensor] = []
+    det_pred_labels: List[torch.Tensor] = []
+    det_sample_ids: List[int] = []
     losses_total = 0.0
     details_total: Dict[str, float] = {}
     n_batches = 0
@@ -1724,6 +1790,15 @@ def eval_one_epoch(
             elif args.exp in DEPTH_ONLY_EXPS:
                 loss, _details = _dense_depth_only_loss(out, batch, args)
                 logits = None
+            elif args.exp in DET_EXPS:
+                gt_boxes = [b.to(device=device, non_blocking=True) for b in batch["gt_bboxes_3d"]]
+                gt_labels = [l.to(device=device, non_blocking=True) for l in batch["gt_labels_3d"]]
+                loss, _details = _unwrap_model(model).det_loss(
+                    out["det_preds"],
+                    gt_boxes,
+                    gt_labels,
+                )
+                logits = None
             elif args.exp in MONOSCENE_LOSS_EXPS:
                 cp = batch["CP_mega_matrix"].to(device, non_blocking=True)
                 loss, _details = criterion(out, target, cp)
@@ -1747,6 +1822,15 @@ def eval_one_epoch(
                 device,
                 _stack_cam2world_from_views(batch, device),
             )
+        if args.exp in DET_EXPS:
+            decoded = _unwrap_model(model).det_decode(out["det_preds"])
+            for i, pred in enumerate(decoded):
+                det_sample_ids.append(int(batch["sample_id"][i]))
+                det_gt_boxes.append(batch["gt_bboxes_3d"][i].cpu())
+                det_gt_labels.append(batch["gt_labels_3d"][i].cpu())
+                det_pred_boxes.append(pred["boxes_3d"].detach().cpu())
+                det_pred_scores.append(pred["scores_3d"].detach().cpu())
+                det_pred_labels.append(pred["labels_3d"].detach().cpu())
         losses_total += float(loss.detach())
         for k, v in _details.items():
             details_total[k] = details_total.get(k, 0.0) + float(v)
@@ -1784,6 +1868,55 @@ def eval_one_epoch(
             ssc.completion_fn = _reduce_scalar(ssc.completion_fn)
 
     stats = ssc.get_stats() if eval_ssc else {}
+    if args.exp in DET_EXPS:
+        if getattr(args, "distributed", False):
+            import torch.distributed as dist
+
+            local_state = {
+                "gt_boxes": det_gt_boxes,
+                "gt_labels": det_gt_labels,
+                "pred_boxes": det_pred_boxes,
+                "pred_scores": det_pred_scores,
+                "pred_labels": det_pred_labels,
+                "sample_ids": det_sample_ids,
+            }
+            gathered = [None for _ in range(misc.get_world_size())]
+            dist.all_gather_object(gathered, local_state)
+            det_gt_boxes = []
+            det_gt_labels = []
+            det_pred_boxes = []
+            det_pred_scores = []
+            det_pred_labels = []
+            det_sample_ids = []
+            for item in gathered:
+                det_gt_boxes.extend(item["gt_boxes"])
+                det_gt_labels.extend(item["gt_labels"])
+                det_pred_boxes.extend(item["pred_boxes"])
+                det_pred_scores.extend(item["pred_scores"])
+                det_pred_labels.extend(item["pred_labels"])
+                det_sample_ids.extend(item["sample_ids"])
+        if det_sample_ids:
+            keep_indices = []
+            seen_ids = set()
+            for i, sid in enumerate(det_sample_ids):
+                if int(sid) in seen_ids:
+                    continue
+                seen_ids.add(int(sid))
+                keep_indices.append(i)
+            det_gt_boxes = [det_gt_boxes[i] for i in keep_indices]
+            det_gt_labels = [det_gt_labels[i] for i in keep_indices]
+            det_pred_boxes = [det_pred_boxes[i] for i in keep_indices]
+            det_pred_scores = [det_pred_scores[i] for i in keep_indices]
+            det_pred_labels = [det_pred_labels[i] for i in keep_indices]
+        stats.update(
+            evaluate_lidar_det_ap40(
+                det_gt_boxes,
+                det_gt_labels,
+                det_pred_boxes,
+                det_pred_scores,
+                det_pred_labels,
+            )
+        )
     if pointmap_accum is not None:
         local_state = pointmap_accum.state_dict()
         gathered = _gather_pointmap_metric_states(local_state, args)
@@ -1812,6 +1945,8 @@ def eval_one_epoch(
         for k, v in stats.items():
             if k.startswith("pointmap_quality_") and isinstance(v, (int, float)):
                 log_writer.add_scalar(f"{tb_prefix}/{k}", v, it)
+            if k.startswith("det_") and isinstance(v, (int, float)):
+                log_writer.add_scalar(f"{tb_prefix}/{k}", v, it)
     if eval_ssc:
         print(
             f"Val {dataset_name} [{epoch}] loss={loss_avg:.4f} IoU={stats['iou']*100:.2f} "
@@ -1819,7 +1954,15 @@ def eval_one_epoch(
             f"R={stats['recall']*100:.2f}"
         )
     else:
-        if args.exp in DEPTH_ONLY_EXPS:
+        if args.exp in DET_EXPS:
+            print(
+                f"Val {dataset_name} [{epoch}] loss={loss_avg:.4f} "
+                f"mAP_bev={stats.get('det_map_bev', 0.0)*100:.2f} "
+                f"mAP_3d={stats.get('det_map_3d', 0.0)*100:.2f} "
+                f"gt={stats.get('det_gt_count', 0.0):.0f} "
+                f"pred={stats.get('det_pred_count', 0.0):.0f}"
+            )
+        elif args.exp in DEPTH_ONLY_EXPS:
             dense = detail_avgs.get("dense_depth", float("nan"))
             valid = detail_avgs.get("dense_depth_valid", float("nan"))
             frames = detail_avgs.get("dense_depth_frames", float("nan"))
@@ -1844,6 +1987,13 @@ def main():
     args.freeze_backbone_epochs = int(args.freeze_backbone_epochs)
     if args.freeze_backbone_epochs < 0:
         raise ValueError("--freeze_backbone_epochs must be >= 0.")
+    if args.exp in DET_EXPS:
+        if bool(getattr(args, "multi_dataset", False)):
+            raise ValueError("Detection experiments do not support --multi_dataset.")
+        if not args.kitti_det_root:
+            raise ValueError("--kitti_det_root is required for detection experiments.")
+    elif not args.processed_root:
+        raise ValueError("--processed_root is required for non-detection experiments.")
     if args.ddad_processed_root and not args.multi_dataset:
         raise ValueError("--ddad_processed_root requires --multi_dataset.")
     if _multi_dataset_with_ddad(args):
@@ -1904,6 +2054,10 @@ def main():
         model_cls = Stage1DepthPostFusionOnlyModel
     elif args.exp == "depth_promptfusion_only":
         model_cls = Stage1DepthPromptFusionOnlyModel
+    elif args.exp == "det_original":
+        model_cls = Stage1DetOriginalModel
+    elif args.exp == "det_postfusion_only":
+        model_cls = Stage1DetPostFusionOnlyModel
     elif args.exp == "bevdetocc_lidar_pointmap_dense_depth":
         model_cls = Stage1SSCBEVDetOccLidarPointmapDenseDepthModel
     elif args.exp == "bevdetocc_lidar_pointmap":
@@ -1933,6 +2087,13 @@ def main():
         model_kwargs["freeze_backbone"] = args.freeze_backbone
         if args.exp == "depth_postfusion_only":
             model_kwargs["backbone"] = args.backbone
+    if args.exp in DET_EXPS:
+        model_kwargs["num_frames"] = args.num_frames
+        model_kwargs["freeze_backbone"] = args.freeze_backbone
+        model_kwargs["backbone"] = args.backbone
+        model_kwargs["det_score_threshold"] = args.det_score_threshold
+        if args.exp == "det_postfusion_only":
+            model_kwargs["fusion_attn_type"] = "cross"
     if args.exp in ("pointmap_original", "depth_original", "depth_promptfusion_only"):
         model_kwargs["num_frames"] = args.num_frames
         model_kwargs["freeze_backbone"] = args.freeze_backbone
@@ -2014,6 +2175,17 @@ def main():
                 f"weight={args.pointmap_loss_weight} "
                 f"conf_alpha={args.pointmap_conf_alpha}"
             )
+    if args.exp in DET_EXPS:
+        print(
+            "[det] KITTI Object reliable-history detection "
+            f"classes={KITTI_OBJECT_CLASS_NAMES} root={args.kitti_det_root}"
+        )
+        print(
+            f"[det] frame_stride={args.frame_stride} num_frames={args.num_frames} "
+            f"score_thr={args.det_score_threshold}"
+        )
+        if args.exp == "det_postfusion_only":
+            print("[fusion] attn_type=cross (detection post-fusion branch)")
     if args.exp == "monoscene_lidar":
         print(f"[fusion] attn_type={args.fusion_attn_type}")
         print(
@@ -2072,6 +2244,7 @@ def main():
                 *BEVDETOCC_LIDAR_EXPS,
                 *POINTMAP_ONLY_EXPS,
                 *DEPTH_ONLY_EXPS,
+                *DET_EXPS,
             )
         )
     )
@@ -2092,7 +2265,9 @@ def main():
     if optimizer is None:
         print("[optimizer] no trainable parameters; running eval/log-only epochs.")
     loss_scaler = NativeScaler(enabled=(args.amp == "fp16"))
-    if args.exp in MONOSCENE_LOSS_EXPS:
+    if args.exp in DET_EXPS:
+        criterion = nn.Identity().to(device)
+    elif args.exp in MONOSCENE_LOSS_EXPS:
         criterion = MonoSceneSSCLoss().to(device)
     elif bool(getattr(args, "multi_dataset", False)):
         criterion = SSCLoss(class_weights=_load_class_weights(args)).to(device)
@@ -2134,7 +2309,7 @@ def main():
                 f"checkpoint expected {prev_hash}, current --occany_ckpt gives {backbone_hash}. "
                 "Refusing to resume — the frozen backbone has changed."
             )
-        if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS) and "model" in ckpt:
+        if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS) and "model" in ckpt:
             if frozen_for_all_epochs and ckpt_frozen_for_all_epochs:
                 model_state = _filter_state_dict_without_backbone(ckpt["model"])
             else:
@@ -2144,12 +2319,12 @@ def main():
                 f"[resume:{args.exp}] loaded model state: "
                 f"missing={len(status.missing_keys)} unexpected={len(status.unexpected_keys)}"
             )
-        elif args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS) and "lifting" in ckpt:
+        elif args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS) and "lifting" in ckpt:
             model_to_save.lifting.load_state_dict(ckpt["lifting"], strict=False)
-        if args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS) and "occ_head" in ckpt:
+        if args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS) and "occ_head" in ckpt:
             model_to_save.occ_head.load_state_dict(ckpt["occ_head"], strict=False)
         if (
-            args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS)
+            args.exp not in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS)
             and "fusion" in ckpt
             and hasattr(model_to_save, "fusion")
         ):
@@ -2263,7 +2438,7 @@ def main():
                 )
 
         if misc.is_main_process():
-            if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS):
+            if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS):
                 if args.freeze_backbone and int(args.freeze_backbone_epochs) == 0:
                     model_state = _state_dict_without_backbone(model_to_save)
                 else:
@@ -2302,7 +2477,7 @@ def main():
             if (epoch + 1) % args.save_freq == 0:
                 torch.save(ckpt_payload, os.path.join(args.output_dir, "checkpoint-last.pth"))
             if args.keep_freq and (epoch + 1) % args.keep_freq == 0:
-                if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS):
+                if args.exp in (*BEVDETOCC_LIDAR_EXPS, *POINTMAP_ONLY_EXPS, *DEPTH_ONLY_EXPS, *DET_EXPS):
                     keep_payload = {
                         "model": ckpt_payload["model"],
                         "epoch": epoch,
