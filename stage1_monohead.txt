@@ -1,6 +1,0 @@
-'/home/dataset-local/lr/code/OccAny/ft/kitti_stage1_5f/models/stage1_ssc.py'当前这个模型使用的occ head'/home/dataset-local/lr/code/OccAny/ft/kitti_stage1_5f/heads/light_occ_3d_unet.py'与标准的monoscene occ 
-  head不相同/home/dataset-local/lr/code/MonoScene-master/monoscene/models/unet3d_kitti.py，我想用标准的monoscene 
-  head再做一次相同的微调，由于当前模型在lift后得到的3d特征形状为(B,65,256,256,32)，特征维度的65=64（特征）+1（置信度），所以使用这样的一个adapter'/home/dataset-local/lr/code/OccAny/adapter.py'来将3d特征的形状变为monoscene head要求的(B,64,128,128,16)。由于monoscene 
-  head还需要开启context_prior，所以你需要在原始数据集的基础上额外读入'/home/dataset-local/lr/code/OccAny/data/kitti_processed/train_00/voxels/000000_1_8.npy'这样的文件，并且要参考monoscene仓库中的方法来生成CP_mega_matrix，从而加上relation loss。各种loss的具体权重参照monoscene仓库中的实现
-  。不要覆盖原有的代码文件，保证你在实现后能同时跑通新实验和旧实验。给'/home/dataset-local/lr/code/OccAny/ft/kitti_stage1_5f/tools/train.py'脚本加上一个命令行参数从而让我指定具体是进行哪一次实验。这次实验依旧冻结occany模型的全部参数，只训练lift模块。adapter模块和occ 
-  head

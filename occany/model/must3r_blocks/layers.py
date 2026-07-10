@@ -61,8 +61,10 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, xpos=None):
+    def forward(self, x, xpos=None, lidar_fusion=None):
         x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+        if lidar_fusion is not None:
+            x = x + lidar_fusion(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
     

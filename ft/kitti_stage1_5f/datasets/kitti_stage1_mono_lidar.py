@@ -1,4 +1,4 @@
-"""MonoScene Stage-1 SemanticKITTI dataset extended with raw LiDAR sweeps.
+"""MonoScene Stage-1 SemanticKITTI dataset extended with LiDAR sweeps.
 
 Same outputs as ``Kitti5FrameStage1MonoDataset``, plus, per sample:
   - ``points_per_frame``: list of 5 float32 tensors, each (P_f, 4) -> (x, y, z, intensity)
@@ -9,8 +9,8 @@ Same outputs as ``Kitti5FrameStage1MonoDataset``, plus, per sample:
   - ``image_hw``: (2,) int32 — (H, W) of each processed frame (same across frames
     in a sample by construction).
 
-The velodyne data is read from a separate ``velodyne_root`` (the raw KITTI
-Odometry layout: ``<velodyne_root>/sequences/<seq>/velodyne/<frame:06d>.bin``).
+LiDAR is read from the processed sequence directory:
+``processed_root/<split>_<seq>/lidar/<frame:06d>.bin``.
 """
 from __future__ import annotations
 
@@ -55,12 +55,12 @@ class Kitti5FrameStage1LidarDataset(Kitti5FrameStage1Dataset):
     def __init__(
         self,
         *args,
-        velodyne_root: str,
+        velodyne_root: str | None = None,
         max_points_per_sweep: int = 0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.velodyne_root = velodyne_root
+        self.velodyne_root = velodyne_root  # kept only for checkpoint/CLI compatibility
         self.max_points_per_sweep = int(max_points_per_sweep)
         if len(self.samples) > 0:
             seq0, t0 = self.samples[0]
@@ -70,11 +70,11 @@ class Kitti5FrameStage1LidarDataset(Kitti5FrameStage1Dataset):
                 if not osp.isfile(p):
                     raise FileNotFoundError(
                         f"Missing velodyne bin for sample 0: {p}. "
-                        f"Check --velodyne_root and KITTI layout."
+                        "Expected processed_root/<split>_<seq>/lidar/*.bin."
                     )
 
     def _velodyne_bin(self, seq: str, frame: int) -> str:
-        return osp.join(self.velodyne_root, "sequences", seq, "velodyne", f"{frame:06d}.bin")
+        return osp.join(self._seq_dir(seq), "lidar", f"{frame:06d}.bin")
 
     def _load_points(self, seq: str, frame: int) -> np.ndarray:
         pts = np.fromfile(self._velodyne_bin(seq, frame), dtype=np.float32).reshape(-1, 4)
@@ -122,12 +122,12 @@ class Kitti5FrameStage1MonoLidarDataset(Kitti5FrameStage1MonoDataset):
     def __init__(
         self,
         *args,
-        velodyne_root: str,
+        velodyne_root: str | None = None,
         max_points_per_sweep: int = 0,  # 0 = keep all
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.velodyne_root = velodyne_root
+        self.velodyne_root = velodyne_root  # kept only for checkpoint/CLI compatibility
         self.max_points_per_sweep = int(max_points_per_sweep)
         # Sanity: at least the first sample's velodyne files should exist.
         if len(self.samples) > 0:
@@ -138,11 +138,11 @@ class Kitti5FrameStage1MonoLidarDataset(Kitti5FrameStage1MonoDataset):
                 if not osp.isfile(p):
                     raise FileNotFoundError(
                         f"Missing velodyne bin for sample 0: {p}. "
-                        f"Check --velodyne_root and KITTI layout."
+                        "Expected processed_root/<split>_<seq>/lidar/*.bin."
                     )
 
     def _velodyne_bin(self, seq: str, frame: int) -> str:
-        return osp.join(self.velodyne_root, "sequences", seq, "velodyne", f"{frame:06d}.bin")
+        return osp.join(self._seq_dir(seq), "lidar", f"{frame:06d}.bin")
 
     def _load_points(self, seq: str, frame: int) -> np.ndarray:
         """Load (P, 4) float32 [x, y, z, intensity] from raw .bin."""

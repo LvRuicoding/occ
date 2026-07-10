@@ -11,8 +11,32 @@ from .lidar_fusion import (
     WindowedCrossAttnLayer,
     WindowedSelfAttnLayer,
 )
+from .encoder_lidar_fusion import EncoderLidarFusion, EncoderLidarFusionLayer
 from .stage1_ssc_mono_lidar import Stage1SSCMonoLidarModel
 from .stage1_ssc_bevdetocc_lidar import Stage1SSCBEVDetOccLidarModel
+from .stage1_ssc_bevdetocc_lidar_dense_depth import (
+    SingleScaleDPTDepthHead,
+    Stage1SSCBEVDetOccLidarDenseDepthModel,
+    dense_metric_depth_loss,
+)
+from .stage1_ssc_bevdetocc_lidar_pointmap import (
+    PostFusionPointmapHead,
+    Stage1SSCBEVDetOccLidarPointmapModel,
+    pointmap_reconstruction_loss,
+)
+from .stage1_pointmap_ablation import (
+    Stage1DepthOriginalModel,
+    Stage1DepthPostFusionOnlyModel,
+    Stage1DepthPromptFusionOnlyModel,
+    Stage1PointmapOriginalModel,
+    Stage1PointmapPostFusionOnlyModel,
+    Stage1SSCBEVDetOccLidarPointmapDenseDepthModel,
+)
+from .stage1_det import (
+    SimpleCenterHead,
+    Stage1DetOriginalModel,
+    Stage1DetPostFusionOnlyModel,
+)
 
 __all__ = [
     "OccAnyRecon5FrameBackbone",
@@ -24,9 +48,26 @@ __all__ = [
     "Stage1SSCMonoModel",
     "Stage1SSCMonoLidarModel",
     "Stage1SSCBEVDetOccLidarModel",
+    "Stage1SSCBEVDetOccLidarDenseDepthModel",
+    "Stage1SSCBEVDetOccLidarPointmapModel",
+    "Stage1DepthOriginalModel",
+    "Stage1DepthPostFusionOnlyModel",
+    "Stage1DepthPromptFusionOnlyModel",
+    "Stage1DetOriginalModel",
+    "Stage1DetPostFusionOnlyModel",
+    "Stage1PointmapOriginalModel",
+    "Stage1PointmapPostFusionOnlyModel",
+    "Stage1SSCBEVDetOccLidarPointmapDenseDepthModel",
+    "SimpleCenterHead",
+    "SingleScaleDPTDepthHead",
+    "PostFusionPointmapHead",
+    "dense_metric_depth_loss",
+    "pointmap_reconstruction_loss",
     "LidarImageFusionModule",
     "Sorted3DTokenFusionLayer",
     "VoxelFeatureEncoder",
     "WindowedCrossAttnLayer",
     "WindowedSelfAttnLayer",
+    "EncoderLidarFusion",
+    "EncoderLidarFusionLayer",
 ]

@@ -1,7 +1,0 @@
-1.点云体素化后，每帧的点云体素相当于有一个当前帧下的一个3d坐标，而且其实stage1还可以输出local pointmap（每一帧图像中每个像素对应的三维点，坐标在当前相机坐标系下），可以利用confiential加权平均的方式得到一个2d融合后图像token的当前帧下的3d坐标
-2.那么就可以了得到一条2d和3d token的依据3d空间坐标排好序的序列，然后在这个序列中，使用长度为80的自注意力模块，如果最后序列长度不是80整数倍，用全0向量做padding
-3.可能有序列的一部分没有图像token只有voxel token，这种序列应该直接跳过
-4.排序方法使用采用的是 serpentine sorting，也就是“蛇形扫描”来排序，类似于(0,0) -> (1,0) -> (2,0) -> (3,0)-> (3,1) -> (2,1) -> (1,1) -> (0,1)这样，但是是在3d空间中
-5.加入type embedding 
-6.padding 的全 0 向量配合 attention mask
-7.self-attention 后恢复 token 原始顺序，只取更新后的 image tokens，并通过 residual gate 更新原 fused image tokens：T_img_out = T_img_fused + alpha * MLP(T_img_attn)其中 alpha 为可学习标量，建议初始化为 0 或很小值。

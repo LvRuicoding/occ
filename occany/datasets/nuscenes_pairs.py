@@ -47,6 +47,7 @@ class Occ3dNuscenesSeqMultiView(BaseSeqDatasetMultiView):
         candidates = [
             os.path.join(os.environ.get('NUSCENES_ROOT', ''), 'annotations.json'),
             os.path.join(preprocessed_root, 'annotations.json'),
+            os.path.join(preprocessed_root, '.metadata', 'annotations.json'),
         ]
         if 'DSDIR' in os.environ:
             candidates.append(os.path.join(os.environ['DSDIR'], 'Occ3D-nuScenes', 'annotations.json'))
@@ -61,7 +62,19 @@ class Occ3dNuscenesSeqMultiView(BaseSeqDatasetMultiView):
 
     @classmethod
     def _load_split_scenes(cls, preprocessed_root, split):
-        annotations_path = cls._resolve_annotations_path(preprocessed_root)
+        try:
+            annotations_path = cls._resolve_annotations_path(preprocessed_root)
+        except FileNotFoundError:
+            split_prefix = f'{split}_'
+            split_scenes = [
+                name for name in os.listdir(preprocessed_root)
+                if os.path.isdir(os.path.join(preprocessed_root, name))
+                and name.startswith(split_prefix)
+            ]
+            if not split_scenes:
+                raise
+            return sorted(split_scenes)
+
         with open(annotations_path, 'r') as f:
             annotations = json.load(f)
 
@@ -69,6 +82,14 @@ class Occ3dNuscenesSeqMultiView(BaseSeqDatasetMultiView):
         if split_key not in annotations:
             raise ValueError(f"Split '{split}' not found in annotations.json")
 
-        return annotations[split_key]
+        raw_scenes = annotations[split_key]
+        available_scenes = {
+            name for name in os.listdir(preprocessed_root)
+            if os.path.isdir(os.path.join(preprocessed_root, name))
+        }
+        prefixed_scenes = [f'{split}_{scene}' for scene in raw_scenes]
+        if any(scene in available_scenes for scene in prefixed_scenes):
+            return [scene for scene in prefixed_scenes if scene in available_scenes]
 
+        return raw_scenes
 

@@ -6,6 +6,9 @@
 # dataset at https://github.com/waymo-research/waymo-open-dataset
 # See datasets_preprocess/preprocess_waymo.py
 # --------------------------------------------------------
+import json
+import os
+
 from occany.datasets.base_seq_dataset import BaseSeqDatasetMultiView
 
 
@@ -17,12 +20,32 @@ class WaymoSeqMultiView(BaseSeqDatasetMultiView):
         self.split = split
         self.is_metric_scale = True
 
+        if self.split is None:
+            return
+
+        metadata_split_path = os.path.join(ROOT, ".metadata", "splits.json")
+        if os.path.exists(metadata_split_path):
+            with open(metadata_split_path, "r") as f:
+                metadata = json.load(f)
+            splits = metadata.get("splits", {})
+            if self.split in ("train", "val"):
+                split_scenes = splits.get(self.split)
+                if split_scenes is None:
+                    raise ValueError(f"Split '{self.split}' not found in {metadata_split_path}")
+                self.select_scene(split_scenes)
+                return
+            if self.split == "debug":
+                debug_scenes = splits.get("train", [])[:4]
+                if not debug_scenes:
+                    debug_scenes = splits.get("val", [])[:4]
+                self.select_scene(debug_scenes)
+                return
+            raise ValueError(f'bad {self.split=}')
+
         val_scenes = (
             "segment-18331713844982117868_2920_900_2940_900_with_camera_labels.tfrecord",
             "segment-9465500459680839281_1100_000_1120_000_with_camera_labels.tfrecord",
         )
-        if self.split is None:
-            return
         if self.split == 'train':
             self.select_scene(val_scenes, opposite=True)
         elif self.split == 'val':

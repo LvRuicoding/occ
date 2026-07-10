@@ -8,7 +8,7 @@ decoder tokens, then replaces the old lifting + MonoScene head with:
   temporal warp/concat -> BEVDet CustomResNet3D + LSSFPN3D ->
   full-grid upsample -> final_conv + predicter.
 
-The returned layout always contains ``{"ssc_logit": (B, 20, X, Y, Z)}``.
+The returned layout always contains ``{"ssc_logit": (B, num_classes, X, Y, Z)}``.
 Training can also request BEVDet-style sparse LiDAR depth supervision targets
 for the LSS depth distribution branch.
 """
@@ -46,233 +46,6 @@ class OccAnyTokenProjector(nn.Module):
         x = self.proj(x)
         C = x.shape[1]
         return x.view(B, N, C, H, W).contiguous()
-
-
-class GeometryResidualConvUnit(nn.Module):
-    """DPT-style residual conv unit for 2D geometry refinement."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        channels = int(channels)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.norm1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.norm2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.gelu(self.norm1(self.conv1(x)))
-        y = self.norm2(self.conv2(y))
-        return F.gelu(x + y)
-
-
-class GeometryFeatureFusionBlock(nn.Module):
-    """Top-down DPT-style feature fusion with optional upsampling."""
-
-    def __init__(
-        self,
-        channels: int,
-        has_residual: bool = True,
-        upsample: bool = True,
-    ) -> None:
-        super().__init__()
-        self.has_residual = bool(has_residual)
-        self.upsample = bool(upsample)
-        self.residual_unit = (
-            GeometryResidualConvUnit(channels) if self.has_residual else None
-        )
-        self.output_unit = GeometryResidualConvUnit(channels)
-        self.out_conv = nn.Conv2d(int(channels), int(channels), kernel_size=1)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        size: Optional[Tuple[int, int]] = None,
-    ) -> torch.Tensor:
-        if self.has_residual and residual is not None and self.residual_unit is not None:
-            x = x + self.residual_unit(residual)
-        x = self.output_unit(x)
-        if self.upsample:
-            if size is None:
-                x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-            else:
-                x = F.interpolate(x, size=size, mode="bilinear", align_corners=False)
-        return self.out_conv(x)
-
-
-class SharedGeometryAdapter(nn.Module):
-    """Shared 2D geometry adapter used by both dense depth and occupancy."""
-
-    def __init__(
-        self,
-        in_channels: int = 256,
-        geometry_channels: int = 256,
-        out_channels: int = 256,
-        residual_gate_init: float = 0.0,
-    ) -> None:
-        super().__init__()
-        in_channels = int(in_channels)
-        geometry_channels = int(geometry_channels)
-        out_channels = int(out_channels)
-
-        self.input_proj = nn.Sequential(
-            nn.Conv2d(in_channels, geometry_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(geometry_channels),
-            nn.GELU(),
-        )
-        self.level1 = GeometryResidualConvUnit(geometry_channels)
-        self.level2 = nn.Sequential(
-            nn.Conv2d(
-                geometry_channels,
-                geometry_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(geometry_channels),
-            nn.GELU(),
-            GeometryResidualConvUnit(geometry_channels),
-        )
-        self.level3 = nn.Sequential(
-            nn.Conv2d(
-                geometry_channels,
-                geometry_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(geometry_channels),
-            nn.GELU(),
-            GeometryResidualConvUnit(geometry_channels),
-        )
-        self.level4 = nn.Sequential(
-            nn.Conv2d(
-                geometry_channels,
-                geometry_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                bias=False,
-            ),
-            nn.BatchNorm2d(geometry_channels),
-            nn.GELU(),
-            GeometryResidualConvUnit(geometry_channels),
-        )
-
-        self.refine4 = GeometryFeatureFusionBlock(
-            geometry_channels, has_residual=False, upsample=True
-        )
-        self.refine3 = GeometryFeatureFusionBlock(
-            geometry_channels, has_residual=True, upsample=True
-        )
-        self.refine2 = GeometryFeatureFusionBlock(
-            geometry_channels, has_residual=True, upsample=True
-        )
-        self.refine1 = GeometryFeatureFusionBlock(
-            geometry_channels, has_residual=True, upsample=False
-        )
-        self.shared_out = GeometryResidualConvUnit(geometry_channels)
-        self.occ_guidance = nn.Sequential(
-            GeometryResidualConvUnit(geometry_channels),
-            nn.Conv2d(geometry_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-        )
-        self.use_input_residual = in_channels == out_channels
-        self.residual_gate = nn.Parameter(
-            torch.tensor(float(residual_gate_init), dtype=torch.float32)
-        )
-
-    def forward(self, feat_2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if feat_2d.ndim != 5:
-            raise RuntimeError(
-                f"feat_2d must be (B, N, C, H, W), got {tuple(feat_2d.shape)}."
-            )
-        B, N, C, H, W = feat_2d.shape
-        x = feat_2d.reshape(B * N, C, H, W).contiguous()
-
-        l1 = self.level1(self.input_proj(x))
-        l2 = self.level2(l1)
-        l3 = self.level3(l2)
-        l4 = self.level4(l3)
-
-        y = self.refine4(l4, size=l3.shape[-2:])
-        y = self.refine3(y, l3, size=l2.shape[-2:])
-        y = self.refine2(y, l2, size=l1.shape[-2:])
-        shared = self.shared_out(self.refine1(y, l1))
-
-        delta = self.occ_guidance(shared)
-        if self.use_input_residual:
-            gate = self.residual_gate.to(device=delta.device, dtype=delta.dtype)
-            refined = x + gate * delta
-        else:
-            refined = delta
-
-        C_refined = refined.shape[1]
-        C_shared = shared.shape[1]
-        refined = refined.view(B, N, C_refined, H, W).contiguous()
-        shared = shared.view(B, N, C_shared, H, W).contiguous()
-        return refined, shared
-
-
-class DenseDepthHead(nn.Module):
-    """Continuous dense depth head on top of shared geometry features."""
-
-    def __init__(self, in_channels: int = 256, hidden_channels: int = 128) -> None:
-        super().__init__()
-        in_channels = int(in_channels)
-        hidden_channels = int(hidden_channels)
-        mid_channels = max(hidden_channels // 4, 32)
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, 1, kernel_size=1),
-        )
-
-    @staticmethod
-    def _target_size(image_hw: torch.Tensor, fallback: Tuple[int, int]) -> Tuple[int, int]:
-        if image_hw is None:
-            return fallback
-        if image_hw.ndim == 3:
-            hw = image_hw[0, 0]
-        elif image_hw.ndim == 2:
-            hw = image_hw[0]
-        else:
-            hw = image_hw
-        return int(hw[0].item()), int(hw[1].item())
-
-    def forward(self, shared_geometry_feat: torch.Tensor, image_hw: torch.Tensor) -> torch.Tensor:
-        if shared_geometry_feat.ndim == 5:
-            B, N, C, H, W = shared_geometry_feat.shape
-            x = shared_geometry_feat.reshape(B * N, C, H, W).contiguous()
-        elif shared_geometry_feat.ndim == 4:
-            B, C, H, W = shared_geometry_feat.shape
-            N = None
-            x = shared_geometry_feat.contiguous()
-        else:
-            raise RuntimeError(
-                "shared_geometry_feat must be (B, C, H, W) or (B, N, C, H, W), got "
-                f"{tuple(shared_geometry_feat.shape)}."
-            )
-        depth_logits = self.head(x)
-        target_h, target_w = self._target_size(image_hw, fallback=(H, W))
-        if depth_logits.shape[-2:] != (target_h, target_w):
-            depth_logits = F.interpolate(
-                depth_logits,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-        pred_depth = F.softplus(depth_logits) + 1e-3
-        if N is None:
-            return pred_depth.view(B, 1, target_h, target_w).contiguous()
-        return pred_depth.view(B, N, 1, target_h, target_w).contiguous()
 
 
 class LSSDepthLift(nn.Module):
@@ -343,6 +116,10 @@ class LSSDepthLift(nn.Module):
 
         K = K_per_frame.to(device=device, dtype=torch.float32)
         T = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T.ndim == 3:
+            T = T[:, None].expand(B, N, 4, 4)
+        elif T.ndim != 4:
+            raise RuntimeError(f"T_cam_from_velo must be (B,4,4) or (B,N,4,4), got {tuple(T.shape)}")
         image_hw = image_hw.to(device=device, dtype=torch.float32)
 
         with torch.amp.autocast(device_type=device.type, enabled=False):
@@ -351,9 +128,9 @@ class LSSDepthLift(nn.Module):
                 img_w = image_hw[b, 1].clamp(min=1.0)
                 scale_x = img_w / float(W_t)
                 scale_y = img_h / float(H_t)
-                R = T[b, :3, :3]
-                t = T[b, :3, 3]
                 for f in range(N):
+                    R = T[b, f, :3, :3]
+                    t = T[b, f, :3, 3]
                     pts = points_per_frame[b][f]
                     if pts.numel() == 0:
                         continue
@@ -426,9 +203,13 @@ class LSSDepthLift(nn.Module):
         W_t: int,
         image_hw: torch.Tensor,
         device: torch.device,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         D = self.depth_channels
-        Gx, Gy, Gz = self.grid_size
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        Gx, Gy, Gz = grid
 
         u, v = self._pixel_centers(H_t, W_t, image_hw, device=device)
         depths = self.depth_values.to(device=device, dtype=torch.float32).view(D, 1, 1)
@@ -449,8 +230,16 @@ class LSSDepthLift(nn.Module):
         p_velo = p_cam.reshape(-1, 3) @ R.T + t
         p_velo = p_velo.view(D, H_t, W_t, 3)
 
-        origin = self.voxel_origin.to(device=device, dtype=torch.float32)
-        size = self.voxel_size.to(device=device, dtype=torch.float32)
+        origin = (
+            self.voxel_origin
+            if voxel_origin is None
+            else voxel_origin
+        ).to(device=device, dtype=torch.float32)
+        size = (
+            self.voxel_size
+            if voxel_size is None
+            else voxel_size
+        ).to(device=device, dtype=torch.float32)
         idx = torch.floor((p_velo - origin) / size).long()
         valid = (
             torch.isfinite(p_velo).all(dim=-1)
@@ -475,11 +264,15 @@ class LSSDepthLift(nn.Module):
         T_cam_from_velo: torch.Tensor,  # (B, 4, 4)
         image_hw: torch.Tensor,      # (B, 2)
         gt_depth: Optional[torch.Tensor] = None,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del gt_depth  # Depth supervision is computed outside the lift operator.
 
         B, N, C, H_t, W_t = feat_2d.shape
-        Gx, Gy, Gz = self.grid_size
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        Gx, Gy, Gz = grid
         device = feat_2d.device
 
         x = feat_2d.reshape(B * N, C, H_t, W_t)
@@ -489,17 +282,34 @@ class LSSDepthLift(nn.Module):
         depth_prob = torch.softmax(depth_logits.float(), dim=1).to(dtype=img_feat.dtype)
 
         volumes = img_feat.new_zeros((B, N, self.out_channels, Gx, Gy, Gz))
-        T_velo_from_cam = torch.linalg.inv(T_cam_from_velo.to(device=device, dtype=torch.float32))
+        T_cam = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T_cam.ndim == 3:
+            T_cam = T_cam[:, None].expand(B, N, 4, 4)
+        T_velo_from_cam = torch.linalg.inv(T_cam)
+
+        origin = (
+            self.voxel_origin
+            if voxel_origin is None
+            else voxel_origin
+        ).to(device=device, dtype=torch.float32)
+        size = (
+            self.voxel_size
+            if voxel_size is None
+            else voxel_size
+        ).to(device=device, dtype=torch.float32)
 
         for b in range(B):
             for f in range(N):
                 lin, valid, hw_idx = self._frustum_voxel_indices(
                     K_per_frame[b, f],
-                    T_velo_from_cam[b],
+                    T_velo_from_cam[b, f],
                     H_t,
                     W_t,
                     image_hw[b],
                     device,
+                    voxel_origin=origin[b] if origin.ndim == 2 else origin,
+                    voxel_size=size[b] if size.ndim == 2 else size,
+                    grid_size=grid,
                 )
                 valid_flat = valid.reshape(-1)
                 if not bool(valid_flat.any().item()):
@@ -579,187 +389,6 @@ def bevdet_depth_loss(
     return weighted_loss, raw_loss.detach(), valid_count.to(dtype=torch.float32)
 
 
-def dense_lss_depth_loss(
-    depth_logits: torch.Tensor,
-    dense_depth_gt: torch.Tensor,
-    has_dense_depth: Optional[torch.Tensor] = None,
-    depth_start: float = 1.0,
-    depth_step: float = 0.4,
-    min_depth: float = 1.0,
-    max_depth: float = 80.0,
-    loss_weight: float = 0.05,
-    target_index: int = 0,
-    min_valid_ratio: float = 0.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Masked target-frame dense-depth CE over the LSS depth distribution."""
-    if depth_logits.ndim != 5:
-        raise RuntimeError(
-            f"depth_logits must be (B, N, D, H, W), got {tuple(depth_logits.shape)}."
-        )
-    B, N, D, H_t, W_t = depth_logits.shape
-    target_index = int(target_index)
-    if target_index < 0 or target_index >= N:
-        raise RuntimeError(f"target_index={target_index} is out of range for N={N}.")
-
-    gt = dense_depth_gt
-    if gt.ndim == 5:
-        gt = gt[:, target_index, 0]
-    elif gt.ndim == 4:
-        if gt.shape[1] == 1:
-            gt = gt[:, 0]
-        else:
-            gt = gt[:, target_index]
-    elif gt.ndim != 3:
-        raise RuntimeError(
-            "dense_depth_gt must be (B,H,W), (B,N,H,W), or (B,N,1,H,W), got "
-            f"{tuple(gt.shape)}."
-        )
-    if gt.shape[0] != B:
-        raise RuntimeError(
-            f"dense_depth_gt batch {gt.shape[0]} does not match depth_logits batch {B}."
-        )
-
-    device_type = depth_logits.device.type
-    with torch.amp.autocast(device_type=device_type, enabled=False):
-        logits = depth_logits[:, target_index].float()
-        gt_f = gt.to(device=logits.device, dtype=torch.float32)
-        valid_src = (
-            torch.isfinite(gt_f)
-            & (gt_f >= float(min_depth))
-            & (gt_f <= float(max_depth))
-        )
-        if has_dense_depth is not None:
-            has = has_dense_depth.to(device=logits.device, dtype=torch.bool)
-            if has.ndim == 2:
-                has = has[:, target_index]
-            elif has.ndim != 1:
-                raise RuntimeError(
-                    "has_dense_depth must be (B,) or (B,N), got "
-                    f"{tuple(has_dense_depth.shape)}."
-                )
-            valid_src = valid_src & has.view(B, 1, 1)
-
-        if gt_f.shape[-2:] == (H_t, W_t):
-            gt_down = gt_f
-            valid = valid_src
-        else:
-            valid_f = valid_src.float()
-            gt_clean = torch.where(valid_src, gt_f, torch.zeros_like(gt_f))
-            depth_sum = F.interpolate(
-                (gt_clean * valid_f).unsqueeze(1),
-                size=(H_t, W_t),
-                mode="area",
-            )[:, 0]
-            valid_ratio = F.interpolate(
-                valid_f.unsqueeze(1),
-                size=(H_t, W_t),
-                mode="area",
-            )[:, 0]
-            gt_down = depth_sum / valid_ratio.clamp(min=1e-6)
-            valid = valid_ratio > float(min_valid_ratio)
-
-        depth_labels = (gt_down - (float(depth_start) - float(depth_step))) / float(depth_step)
-        valid = valid & (depth_labels >= 1.0) & (depth_labels < float(D + 1))
-        valid_count = valid.sum()
-        if not bool(valid_count.item()):
-            zero = logits.sum() * 0.0
-            return zero, zero.detach(), valid_count.to(dtype=torch.float32)
-
-        label_ids = depth_labels.long().clamp(min=1, max=D) - 1
-        logits_flat = logits.permute(0, 2, 3, 1).contiguous()[valid]
-        labels_flat = label_ids[valid]
-        raw_loss = F.cross_entropy(logits_flat, labels_flat, reduction="mean")
-        weighted_loss = float(loss_weight) * raw_loss
-    return weighted_loss, raw_loss.detach(), valid_count.to(dtype=torch.float32)
-
-
-def dense_depth_loss(
-    pred_depth: torch.Tensor,
-    gt_depth: torch.Tensor,
-    has_dense_depth: Optional[torch.Tensor] = None,
-    min_depth: float = 1.0,
-    max_depth: float = 80.0,
-    loss_weight: float = 0.3,
-    si_weight: float = 0.05,
-    target_index: int = 0,
-    eps: float = 1e-3,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Masked continuous dense-depth loss on the target frame only."""
-    if pred_depth.ndim == 5:
-        pred = pred_depth[:, int(target_index), 0]
-    elif pred_depth.ndim == 4:
-        if pred_depth.shape[1] != 1:
-            raise RuntimeError(
-                f"4D pred_depth must be (B, 1, H, W), got {tuple(pred_depth.shape)}."
-            )
-        pred = pred_depth[:, 0]
-    elif pred_depth.ndim == 3:
-        pred = pred_depth
-    else:
-        raise RuntimeError(
-            "pred_depth must be (B,H,W), (B,1,H,W), or (B,N,1,H,W), got "
-            f"{tuple(pred_depth.shape)}."
-        )
-
-    gt = gt_depth
-    if gt.ndim == 5:
-        gt = gt[:, int(target_index), 0]
-    elif gt.ndim == 4:
-        if gt.shape[1] == 1:
-            gt = gt[:, 0]
-        else:
-            gt = gt[:, int(target_index)]
-    elif gt.ndim != 3:
-        raise RuntimeError(
-            f"gt_depth must be (B,H,W), (B,N,H,W), or (B,N,1,H,W), got {tuple(gt.shape)}."
-        )
-    if gt.shape != pred.shape:
-        raise RuntimeError(
-            f"dense depth GT shape {tuple(gt.shape)} does not match prediction {tuple(pred.shape)}."
-        )
-
-    device_type = pred.device.type
-    with torch.amp.autocast(device_type=device_type, enabled=False):
-        pred_f = pred.float().clamp(min=float(eps))
-        gt_f = gt.to(device=pred_f.device, dtype=torch.float32)
-        valid = (
-            torch.isfinite(pred_f)
-            & torch.isfinite(gt_f)
-            & (gt_f >= float(min_depth))
-            & (gt_f <= float(max_depth))
-        )
-        if has_dense_depth is not None:
-            has = has_dense_depth.to(device=pred_f.device, dtype=torch.bool)
-            if has.ndim == 2:
-                has = has[:, int(target_index)]
-            elif has.ndim != 1:
-                raise RuntimeError(
-                    "has_dense_depth must be (B,) or (B,N), got "
-                    f"{tuple(has_dense_depth.shape)}."
-                )
-            valid = valid & has.view(-1, 1, 1)
-
-        valid_count = valid.sum()
-        if not bool(valid_count.item()):
-            zero = pred_f.sum() * 0.0
-            return zero, zero.detach(), zero.detach(), valid_count.to(dtype=torch.float32)
-
-        log_diff = torch.log(pred_f[valid]) - torch.log(gt_f[valid].clamp(min=float(eps)))
-        log_l1 = log_diff.abs().mean()
-        if float(si_weight) > 0.0:
-            si_loss = (log_diff.square().mean() - log_diff.mean().square()).clamp(min=0.0)
-        else:
-            si_loss = log_l1 * 0.0
-        raw_loss = log_l1 + float(si_weight) * si_loss
-        weighted_loss = float(loss_weight) * raw_loss
-    return (
-        weighted_loss,
-        log_l1.detach(),
-        si_loss.detach(),
-        valid_count.to(dtype=torch.float32),
-    )
-
-
 class PerFrameLidarMemory(nn.Module):
     """Dense 32-channel LiDAR memory volume in each frame's velo coordinates."""
 
@@ -790,15 +419,29 @@ class PerFrameLidarMemory(nn.Module):
         self,
         points_per_frame: List[List[torch.Tensor]],
         output_dtype: torch.dtype,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B = len(points_per_frame)
         if B == 0:
             raise RuntimeError("points_per_frame must contain at least one sample.")
         N = len(points_per_frame[0])
         memories: List[torch.Tensor] = []
+        origin = None if voxel_origin is None else voxel_origin.to(
+            device=self.encoder.vox_origin.device, dtype=torch.float32
+        )
+        size = None if voxel_size is None else voxel_size.to(
+            device=self.encoder.vox_size.device, dtype=torch.float32
+        )
         for f in range(N):
             points_list = [points_per_frame[b][f] for b in range(B)]
-            mem, occ = self.encoder(points_list)
+            mem, occ = self.encoder(
+                points_list,
+                vox_origin=None if origin is None else origin[0],
+                vox_size=None if size is None else size[0],
+                vox_grid=grid_size,
+            )
             mem = mem.to(dtype=output_dtype)
             occ = occ.to(dtype=output_dtype)
             empty = self.empty_embed.view(1, -1, 1, 1, 1).to(
@@ -875,10 +518,30 @@ class FrameVolumeWarper(nn.Module):
         self.register_buffer("voxel_origin", origin, persistent=False)
         self.register_buffer("voxel_size", size, persistent=False)
 
+    @staticmethod
+    def _centers_for_grid(
+        grid_size: Tuple[int, int, int],
+        voxel_origin: torch.Tensor,
+        voxel_size: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        Gx, Gy, Gz = tuple(int(v) for v in grid_size)
+        ix = torch.arange(Gx, dtype=torch.float32, device=device)
+        iy = torch.arange(Gy, dtype=torch.float32, device=device)
+        iz = torch.arange(Gz, dtype=torch.float32, device=device)
+        grid_ix, grid_iy, grid_iz = torch.meshgrid(ix, iy, iz, indexing="ij")
+        idx = torch.stack([grid_ix, grid_iy, grid_iz], dim=-1)
+        return (idx + 0.5) * voxel_size.to(device=device, dtype=torch.float32) + voxel_origin.to(
+            device=device, dtype=torch.float32
+        )
+
     def _warp_one(
         self,
         volume: torch.Tensor,  # (B, C, X, Y, Z)
         T_target_from_frame_velo: torch.Tensor,
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B, _C, Gx, Gy, Gz = volume.shape
         device = volume.device
@@ -886,13 +549,26 @@ class FrameVolumeWarper(nn.Module):
         R_inv = T_inv[:, :3, :3]
         t_inv = T_inv[:, :3, 3]
 
-        centers = self.target_centers.to(device=device, dtype=torch.float32)
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        origin = (
+            self.voxel_origin
+            if voxel_origin is None
+            else voxel_origin
+        ).to(device=device, dtype=torch.float32)
+        size = (
+            self.voxel_size
+            if voxel_size is None
+            else voxel_size
+        ).to(device=device, dtype=torch.float32)
+        centers = (
+            self.target_centers.to(device=device, dtype=torch.float32)
+            if grid == self.grid_size and voxel_origin is None and voxel_size is None
+            else self._centers_for_grid(grid, origin, size, device)
+        )
         flat_centers = centers.reshape(-1, 3).unsqueeze(0).expand(B, -1, 3)
         p_frame = torch.einsum("bij,bvj->bvi", R_inv, flat_centers) + t_inv.unsqueeze(1)
         p_frame = p_frame.view(B, Gx, Gy, Gz, 3)
 
-        origin = self.voxel_origin.to(device=device, dtype=torch.float32)
-        size = self.voxel_size.to(device=device, dtype=torch.float32)
         frac = (p_frame - origin) / size
         norm_x = (frac[..., 0] / float(Gx)) * 2.0 - 1.0
         norm_y = (frac[..., 1] / float(Gy)) * 2.0 - 1.0
@@ -914,27 +590,41 @@ class FrameVolumeWarper(nn.Module):
         T_target_from_refcam: torch.Tensor,    # (B, 4, 4)
         T_cam_from_velo: torch.Tensor,         # (B, 4, 4)
         cam2world_per_frame: torch.Tensor,     # (B, N, 4, 4)
+        voxel_origin: Optional[torch.Tensor] = None,
+        voxel_size: Optional[torch.Tensor] = None,
+        grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B, N, C, X, Y, Z = volumes.shape
-        if (X, Y, Z) != self.grid_size:
+        grid = self.grid_size if grid_size is None else tuple(int(v) for v in grid_size)
+        if (X, Y, Z) != grid:
             raise RuntimeError(
-                f"volume grid {(X, Y, Z)} does not match warper grid {self.grid_size}."
+                f"volume grid {(X, Y, Z)} does not match warper grid {grid}."
             )
         device = volumes.device
         T_tr = T_target_from_refcam.to(device=device, dtype=torch.float32)
         T_cv = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T_cv.ndim == 3:
+            T_cv = T_cv[:, None].expand(B, N, 4, 4)
         c2w = cam2world_per_frame.to(device=device, dtype=torch.float32)
         c2w_ref_inv = torch.linalg.inv(c2w[:, 0])
 
         warped: List[torch.Tensor] = []
         for f in range(N):
-            T_target_from_frame_velo = T_tr @ c2w_ref_inv @ c2w[:, f] @ T_cv
-            warped.append(self._warp_one(volumes[:, f], T_target_from_frame_velo))
+            T_target_from_frame_velo = T_tr @ c2w_ref_inv @ c2w[:, f] @ T_cv[:, f]
+            warped.append(
+                self._warp_one(
+                    volumes[:, f],
+                    T_target_from_frame_velo,
+                    voxel_origin=voxel_origin[0] if voxel_origin is not None and voxel_origin.ndim == 2 else voxel_origin,
+                    voxel_size=voxel_size[0] if voxel_size is not None and voxel_size.ndim == 2 else voxel_size,
+                    grid_size=grid,
+                )
+            )
         return torch.stack(warped, dim=1).view(B, N, C, X, Y, Z).contiguous()
 
 
 class Stage1SSCBEVDetOccLidarModel(nn.Module):
-    """Frozen OccAny + 2D cross-attn fusion + BEVDet-OCC style 3D backend."""
+    """OccAny + 2D cross-attn fusion + BEVDet-OCC style 3D backend."""
 
     def __init__(
         self,
@@ -962,9 +652,6 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         fusion_attn_type: str = "cross",
         lss_in_channels: int = 256,
         lss_out_channels: int = 32,
-        use_shared_geometry_adapter: bool = False,
-        geometry_channels: int = 256,
-        geometry_adapter_gate_init: float = 0.0,
         lidar_d_voxel: int = 128,
         lidar_hidden: int = 64,
         lidar_pe_num_freqs: int = 8,
@@ -976,17 +663,20 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         bevdet_neck_channels: int = 32,
         num_frames: int = 5,
         with_cp: bool = False,
+        freeze_backbone: bool = False,
     ) -> None:
         super().__init__()
         del c_lift  # kept for train.py compatibility; this backend does not use Stage1LiftingModule.
         self.num_frames = int(num_frames)
         self.half_grid_size = tuple(int(v) for v in half_grid_size)
+        self.freeze_backbone = bool(freeze_backbone)
 
         self.backbone = OccAnyRecon5FrameBackbone(
             img_size=backbone_img_size,
             embed_dim=token_dim,
             patch_size=patch_size,
             backbone_dtype=backbone_dtype,
+            freeze=self.freeze_backbone,
         )
         if occany_ckpt is not None:
             self.backbone.load_checkpoint(occany_ckpt)
@@ -1018,18 +708,6 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             token_dim=token_dim,
             out_channels=lss_in_channels,
         )
-        self.use_shared_geometry_adapter = bool(use_shared_geometry_adapter)
-        if self.use_shared_geometry_adapter:
-            self.geometry_adapter = SharedGeometryAdapter(
-                in_channels=lss_in_channels,
-                geometry_channels=geometry_channels,
-                out_channels=lss_in_channels,
-                residual_gate_init=geometry_adapter_gate_init,
-            )
-            self.dense_depth_head = DenseDepthHead(in_channels=geometry_channels)
-        else:
-            self.geometry_adapter = None
-            self.dense_depth_head = None
         self.lss = LSSDepthLift(
             in_channels=lss_in_channels,
             out_channels=lss_out_channels,
@@ -1081,9 +759,14 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             with_cp=with_cp,
         )
 
+    def set_freeze_backbone(self, freeze: bool = True) -> None:
+        self.freeze_backbone = bool(freeze)
+        self.backbone.set_frozen(self.freeze_backbone)
+
     def train(self, mode: bool = True):
         super().train(mode)
-        self.backbone.eval()
+        if self.freeze_backbone:
+            self.backbone.eval()
         return self
 
     @staticmethod
@@ -1112,12 +795,48 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
         image_hw: torch.Tensor,
         gt_depth: Optional[torch.Tensor] = None,
         return_depth: bool = False,
-        return_lss_depth: bool = False,
-        dense_depth_gt: Optional[torch.Tensor] = None,
-        has_dense_depth: Optional[torch.Tensor] = None,
-        return_dense_depth: bool = False,
+        grid_config: Optional[Dict[str, torch.Tensor | Tuple[int, int, int]]] = None,
     ) -> Dict[str, torch.Tensor]:
+        batch_size = int(T_target_from_refcam.shape[0])
+
+        def _grid_tuple(name: str, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
+            if grid_config is None or name not in grid_config:
+                return default
+            value = grid_config[name]
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 2:
+                    if value.shape[0] > 1 and not torch.equal(value, value[:1].expand_as(value)):
+                        raise RuntimeError(
+                            f"{name} must be identical within a batch; got {value.tolist()}"
+                        )
+                    value = value[0]
+                return tuple(int(v) for v in value.detach().cpu().tolist())
+            return tuple(int(v) for v in value)
+
+        def _grid_tensor(name: str, default: torch.Tensor, device: torch.device) -> torch.Tensor:
+            if grid_config is None or name not in grid_config:
+                return default.to(device=device, dtype=torch.float32).view(1, 3)
+            value = grid_config[name]
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, dtype=torch.float32)
+            value = value.to(device=device, dtype=torch.float32)
+            if value.ndim == 1:
+                value = value.view(1, 3)
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1)
+            return value
+
+        half_grid = _grid_tuple("half_grid_size", self.half_grid_size)
+        full_grid = _grid_tuple("grid_size", self.occ_head.full_grid)
+
         backbone_out = self.backbone(views)
+        fusion_origin = None
+        fusion_size = None
+        fusion_grid = None
+        if grid_config is not None:
+            fusion_origin = grid_config.get("fusion_vox_origin")
+            fusion_size = grid_config.get("fusion_vox_size")
+            fusion_grid = _grid_tuple("fusion_vox_grid", self.fusion.vfe.vox_grid)
         t_rec_fused = self.fusion(
             backbone_out["t_rec"],
             points_per_frame=points_per_frame,
@@ -1126,6 +845,9 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             image_hw=image_hw,
             p_rec_local=backbone_out.get("p_rec_local"),
             c_rec=backbone_out["c_rec"],
+            fusion_vox_origin=fusion_origin,
+            fusion_vox_size=fusion_size,
+            fusion_vox_grid=fusion_grid,
         )
         B, N = t_rec_fused.shape[:2]
         if N != self.num_frames:
@@ -1134,29 +856,25 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             )
 
         feat_2d = self.token_projector(t_rec_fused)
-        shared_geometry_feat: Optional[torch.Tensor] = None
-        if self.geometry_adapter is not None:
-            feat_2d, shared_geometry_feat = self.geometry_adapter(feat_2d)
-        elif return_dense_depth:
-            raise RuntimeError(
-                "return_dense_depth=True requires use_shared_geometry_adapter=True."
-            )
-        pred_dense_depth: Optional[torch.Tensor] = None
-        if return_dense_depth:
-            if self.dense_depth_head is None or shared_geometry_feat is None:
-                raise RuntimeError("dense depth head is not initialized.")
-            pred_dense_depth = self.dense_depth_head(
-                shared_geometry_feat[:, 0],
-                image_hw.to(device=feat_2d.device),
-            )
+        half_origin = _grid_tensor("half_voxel_origin", self.lss.voxel_origin, feat_2d.device)
+        half_size = _grid_tensor("half_voxel_size", self.lss.voxel_size, feat_2d.device)
         lss_volume, depth_logits = self.lss(
             feat_2d=feat_2d,
             K_per_frame=K_per_frame.to(device=feat_2d.device),
             T_cam_from_velo=T_cam_from_velo.to(device=feat_2d.device),
             image_hw=image_hw.to(device=feat_2d.device),
             gt_depth=gt_depth,
+            voxel_origin=half_origin,
+            voxel_size=half_size,
+            grid_size=half_grid,
         )
-        memory = self.lidar_memory(points_per_frame, output_dtype=lss_volume.dtype)
+        memory = self.lidar_memory(
+            points_per_frame,
+            output_dtype=lss_volume.dtype,
+            voxel_origin=half_origin,
+            voxel_size=half_size,
+            grid_size=half_grid,
+        )
         memory = memory.to(device=lss_volume.device, dtype=lss_volume.dtype)
         enhanced = self.natten_fusion(lss_volume, memory)
         per_frame = torch.cat([enhanced, memory], dim=2)  # (B, N, 64, X, Y, Z)
@@ -1167,30 +885,15 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
             T_target_from_refcam=T_target_from_refcam.to(device=per_frame.device),
             T_cam_from_velo=T_cam_from_velo.to(device=per_frame.device),
             cam2world_per_frame=cam2world,
+            voxel_origin=half_origin.to(device=per_frame.device),
+            voxel_size=half_size.to(device=per_frame.device),
+            grid_size=half_grid,
         )
         B, N, C, X, Y, Z = warped.shape
         temporal = warped.view(B, N * C, X, Y, Z)
         temporal = self.temporal_reduce(temporal)
-        logits = self.occ_head(temporal)
+        logits = self.occ_head(temporal, full_grid=full_grid)
         out: Dict[str, torch.Tensor] = {"ssc_logit": logits}
-        if return_dense_depth:
-            if pred_dense_depth is None:
-                raise RuntimeError("dense depth prediction was not computed.")
-            out["pred_dense_depth"] = pred_dense_depth
-        if dense_depth_gt is not None:
-            out["dense_depth_gt"] = dense_depth_gt.to(
-                device=depth_logits.device, dtype=torch.float32
-            )
-        if has_dense_depth is not None:
-            out["has_dense_depth"] = has_dense_depth.to(
-                device=depth_logits.device, dtype=torch.bool
-            )
-        if return_depth or return_lss_depth:
-            out.update(
-                depth_logits=depth_logits,
-                depth_start=self.lss.depth_start,
-                depth_step=self.lss.depth_step,
-            )
         if return_depth:
             if gt_depth is None:
                 gt_depth = self.lss.build_depth_target(
@@ -1203,14 +906,12 @@ class Stage1SSCBEVDetOccLidarModel(nn.Module):
                     device=depth_logits.device,
                 )
             out.update(
+                depth_logits=depth_logits,
                 gt_depth=gt_depth.to(device=depth_logits.device, dtype=torch.float32),
+                depth_start=self.lss.depth_start,
+                depth_step=self.lss.depth_step,
             )
         return out
 
 
-__all__ = [
-    "Stage1SSCBEVDetOccLidarModel",
-    "bevdet_depth_loss",
-    "dense_lss_depth_loss",
-    "dense_depth_loss",
-]
+__all__ = ["Stage1SSCBEVDetOccLidarModel"]

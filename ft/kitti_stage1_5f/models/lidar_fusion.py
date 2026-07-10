@@ -106,6 +106,9 @@ class VoxelFeatureEncoder(nn.Module):
         self,
         points_velo: torch.Tensor,       # (P, 4) (x, y, z, intensity), float32
         T_cam_from_velo: torch.Tensor,   # (4, 4), float32
+        vox_origin: Optional[torch.Tensor] = None,
+        vox_size: Optional[torch.Tensor] = None,
+        vox_grid: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Returns (voxel_feat, voxel_center_cam) or (None, None) if no voxel survives.
 
@@ -123,9 +126,17 @@ class VoxelFeatureEncoder(nn.Module):
         t = T[:3, 3]
         p_cam = p_velo @ R.T + t  # (P, 3)
 
-        vox_origin = self.vox_origin
-        vox_size = self.vox_size
-        Gx, Gy, Gz = self.vox_grid
+        vox_origin = (
+            self.vox_origin
+            if vox_origin is None
+            else vox_origin.to(device=p_cam.device, dtype=torch.float32)
+        )
+        vox_size = (
+            self.vox_size
+            if vox_size is None
+            else vox_size.to(device=p_cam.device, dtype=torch.float32)
+        )
+        Gx, Gy, Gz = self.vox_grid if vox_grid is None else tuple(int(v) for v in vox_grid)
 
         idx_f = (p_cam - vox_origin) / vox_size
         idx = idx_f.floor().long()  # (P, 3)
@@ -302,13 +313,14 @@ class WindowedCrossAttnLayer(nn.Module):
         voxel_h_t: torch.Tensor,         # (V_total,) int64
         voxel_w_t: torch.Tensor,         # (V_total,) int64
         voxel_valid: torch.Tensor,       # (V_total,) bool
+        return_update: bool = False,
     ) -> torch.Tensor:
         F_n, H_t, W_t, D = image_feat.shape
         device = image_feat.device
 
         # If nothing valid → identity.
         if voxel_valid.sum().item() == 0:
-            return image_feat
+            return torch.zeros_like(image_feat) if return_update else image_feat
 
         # Restrict to valid voxels.
         vf_idx = voxel_frame_idx[voxel_valid]
@@ -396,8 +408,8 @@ class WindowedCrossAttnLayer(nn.Module):
 
         # Gather destination indices.
         valid_pos = q_mask  # (n_active, M_Q)
-        # Output image (we modify a copy to avoid in-place issues with autograd).
-        out = image_feat.clone()
+        # Output image/update (we modify a copy to avoid in-place issues with autograd).
+        out = torch.zeros_like(image_feat) if return_update else image_feat.clone()
         # Use vectorized fancy indexing.
         frame_idx_exp = active_frame.unsqueeze(-1).expand_as(wh_safe)[valid_pos]
         h_idx = wh_safe[valid_pos]
@@ -1247,6 +1259,9 @@ class LidarImageFusionModule(nn.Module):
         image_hw: torch.Tensor,                       # (B, 2) (H, W)
         p_rec_local: Optional[torch.Tensor] = None,   # (B, N, H_p, W_p, 3)
         c_rec: Optional[torch.Tensor] = None,         # (B, N, H_p, W_p)
+        fusion_vox_origin: Optional[torch.Tensor] = None,
+        fusion_vox_size: Optional[torch.Tensor] = None,
+        fusion_vox_grid: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         B, N, H_t, W_t, D = t_rec.shape
         if (H_t, W_t) != (self.H_t, self.W_t):
@@ -1267,14 +1282,32 @@ class LidarImageFusionModule(nn.Module):
         all_voxel_valid: List[torch.Tensor] = []
 
         device = t_rec.device
+        T_cv_all = T_cam_from_velo.to(device=device, dtype=torch.float32)
+        if T_cv_all.ndim == 3:
+            T_cv_all = T_cv_all[:, None].expand(B, N, 4, 4)
+        dyn_origin = (
+            None
+            if fusion_vox_origin is None
+            else fusion_vox_origin.to(device=device, dtype=torch.float32)
+        )
+        dyn_size = (
+            None
+            if fusion_vox_size is None
+            else fusion_vox_size.to(device=device, dtype=torch.float32)
+        )
         for b in range(B):
             img_H = int(image_hw[b, 0].item())
             img_W = int(image_hw[b, 1].item())
-            T_cv = T_cam_from_velo[b]  # (4, 4)
             for f in range(N):
                 pts = points_per_frame[b][f]
                 pts = pts.to(device=device, non_blocking=True)
-                feat, center = self.vfe(pts, T_cv)
+                feat, center = self.vfe(
+                    pts,
+                    T_cv_all[b, f],
+                    vox_origin=None if dyn_origin is None else dyn_origin[b],
+                    vox_size=None if dyn_size is None else dyn_size[b],
+                    vox_grid=fusion_vox_grid,
+                )
                 if feat is None or feat.shape[0] == 0:
                     continue
                 K = K_per_frame[b, f]  # (3, 3)
@@ -1407,10 +1440,23 @@ class PerFrameMemoryVoxelEncoder(nn.Module):
     def forward(
         self,
         points_velo_list: List[torch.Tensor],  # list length B of (P_b, 4) in frame-velo
+        vox_origin: Optional[torch.Tensor] = None,
+        vox_size: Optional[torch.Tensor] = None,
+        vox_grid: Optional[Tuple[int, int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = len(points_velo_list)
-        Gx, Gy, Gz = self.vox_grid
         device = self.vox_origin.device
+        vox_origin_t = (
+            self.vox_origin
+            if vox_origin is None
+            else vox_origin.to(device=device, dtype=torch.float32)
+        )
+        vox_size_t = (
+            self.vox_size
+            if vox_size is None
+            else vox_size.to(device=device, dtype=torch.float32)
+        )
+        Gx, Gy, Gz = self.vox_grid if vox_grid is None else tuple(int(v) for v in vox_grid)
         # Dtype follows point MLP's parameter dtype (matches autocast / module dtype).
         param_dtype = next(self.voxel_proj.parameters()).dtype
 
@@ -1435,13 +1481,10 @@ class PerFrameMemoryVoxelEncoder(nn.Module):
         pts_cat = torch.cat(non_empty_points, dim=0)
         batch_cat = torch.cat(non_empty_batch, dim=0)
 
-        vox_origin = self.vox_origin
-        vox_size = self.vox_size
-
         p_velo = pts_cat[:, :3].to(dtype=torch.float32)
         intensity = pts_cat[:, 3:4].to(dtype=torch.float32)
 
-        idx_f = (p_velo - vox_origin) / vox_size
+        idx_f = (p_velo - vox_origin_t) / vox_size_t
         idx = idx_f.floor().long()
         valid = (
             torch.isfinite(p_velo).all(dim=-1)
@@ -1461,7 +1504,7 @@ class PerFrameMemoryVoxelEncoder(nn.Module):
         p_valid = p_velo[valid]
         i_valid = intensity[valid]
         batch_valid = batch_cat[valid]
-        voxel_center = (idx.to(p_valid.dtype) + 0.5) * vox_size + vox_origin
+        voxel_center = (idx.to(p_valid.dtype) + 0.5) * vox_size_t + vox_origin_t
         rel = p_valid - voxel_center
         point_feat = torch.cat([p_valid, i_valid, rel], dim=-1)  # (P_valid, 7)
 
@@ -1493,7 +1536,7 @@ class PerFrameMemoryVoxelEncoder(nn.Module):
         u_y = (local // Gz) % Gy
         u_z = local % Gz
         uniq_idx = torch.stack([u_x, u_y, u_z], dim=-1).to(dtype=torch.float32)
-        vc_world = (uniq_idx + 0.5) * vox_size + vox_origin
+        vc_world = (uniq_idx + 0.5) * vox_size_t + vox_origin_t
         pe = VoxelFeatureEncoder._sinusoidal_pe_3d(vc_world, self.pe_num_freqs).to(
             voxel_proj.dtype
         )

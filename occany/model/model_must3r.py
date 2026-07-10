@@ -76,13 +76,26 @@ class Dust3rEncoder(BaseTransformer):
         self.grid_size = self.patch_embed.grid_size
 
     @torch.autocast("cuda", dtype=torch.float32)
-    def forward(self, img, true_shape):
+    def forward(self, img, true_shape, encoder_lidar_fusion=None, encoder_lidar_context=None):
         # img: [80, 3, 80, 224])
         x, pos = self.patch_embed(img, true_shape=true_shape)
         
         # x: [80, 70, 1024]
-        for blk in self.blocks_enc:
-            x = blk(x, pos)
+        for i, blk in enumerate(self.blocks_enc):
+            lidar_fusion = None
+            if (
+                encoder_lidar_fusion is not None
+                and encoder_lidar_context is not None
+                and encoder_lidar_fusion.has_layer(i)
+            ):
+                lidar_fusion = (
+                    lambda tokens, layer_idx=i: encoder_lidar_fusion(
+                        tokens,
+                        layer_idx=layer_idx,
+                        context=encoder_lidar_context,
+                    )
+                )
+            x = blk(x, pos, lidar_fusion=lidar_fusion)
         x = self.norm_enc(x)
         return x, pos
 
@@ -1138,5 +1151,4 @@ class Must3r (nn.Module):
         res2['pts3d_in_other_view'] = res2.pop('pts3d')  # predict view2's pts3d in view1's frame
         res3['pts3d_in_other_view'] = res3.pop('pts3d') # predict forecast's pts3d in view1's frame
         return res1, res2, res3
-
 

@@ -42,13 +42,21 @@ class SeqMaker:
 
 
     def _get_processed_root(self, preprocessed_dir):
+        override = os.environ.get("OCCANY_SEQ_ROOT")
+        if override:
+            return override
         assert "SCRATCH" in os.environ, "SCRATCH environment variable is not set"
         SCRATCH = os.environ["SCRATCH"]
         return os.path.join(SCRATCH, f"data/{preprocessed_dir}")
 
     def _load_scenes_and_frames(self):
         print("Loading scenes and frames...")
-        self.scenes = [d for d in os.listdir(self.processed_root) if os.path.isdir(os.path.join(self.processed_root, d)) and "tmp" not in d]
+        self.scenes = [
+            d for d in os.listdir(self.processed_root)
+            if os.path.isdir(os.path.join(self.processed_root, d))
+            and not d.startswith(".")
+            and "tmp" not in d
+        ]
         self.scenes.sort()
         print(f"Loaded {len(self.scenes)} scenes")
         frames_set = set()
@@ -186,6 +194,8 @@ def parse_arguments():
     parser.add_argument('--subsampling_rate', type=int, default=5, help='Subsampling rate for image pairs')
     parser.add_argument('--max_stride', type=int, default=2, help='Maximum stride for image pairs at subsampling_rate')
     parser.add_argument('--dataset', type=str, default="ddad", help='Dataset name')
+    parser.add_argument('--processed_root', type=str, default=None,
+                        help='Explicit processed dataset root. Overrides SCRATCH/data/<dataset>_processed.')
     parser.add_argument('--camera', type=str, choices=["all", "surround"], default="all",
                         help='Camera ID (all for temporal mode, or surround)')
     parser.add_argument('--seq_mode', type=str, choices=["temporal", "surround"], default="temporal", 
@@ -202,6 +212,11 @@ def resolve_cameras(dataset, camera, seq_mode):
             "surround": list(range(1, 6)),
             "all": list(range(1, 6)),
         }
+    elif dataset == "waymo_tiny":
+        camera_map = {
+            "surround": list(range(5)),
+            "all": list(range(5)),
+        }
     elif dataset == "ddad":
         camera_map = {
             "surround": list(range(6)),
@@ -216,6 +231,11 @@ def resolve_cameras(dataset, camera, seq_mode):
         camera_map = {
             "surround": ["cam01", "cam05", "cam06", "cam07", "cam08"],
             "all": ["cam06", "cam07", "cam08", "cam09"],
+        }
+    elif dataset == "nuscenes":
+        camera_map = {
+            "surround": list(range(6)),
+            "all": list(range(6)),
         }
     else:
         raise ValueError(f"Dataset {dataset} does not define camera presets")
@@ -234,6 +254,8 @@ def resolve_sequence_suffix(camera, seq_mode):
 
 if __name__ == "__main__":
     args = parse_arguments()
+    if args.processed_root is not None:
+        os.environ["OCCANY_SEQ_ROOT"] = args.processed_root
 
     if args.dataset == "waymo":
         cameras = resolve_cameras(args.dataset, args.camera, args.seq_mode)
@@ -241,6 +263,18 @@ if __name__ == "__main__":
                                      cameras=cameras,
                                      img_track_pattern="*_{camera_id}",
                                      frame_id_format=":05d",
+                                     prefix=args.prefix,
+                                     suffix=resolve_sequence_suffix(args.camera, args.seq_mode),
+                                     subsampling_rate=args.subsampling_rate,
+                                     max_stride=args.max_stride,
+                                     seq_mode=args.seq_mode)
+    elif args.dataset == "waymo_tiny":
+        cameras = resolve_cameras(args.dataset, args.camera, args.seq_mode)
+        seq_maker = SeqMaker(preprocessed_dir="waymo_tiny_processed",
+                                     cameras=cameras,
+                                     img_track_pattern="*_{camera_id}",
+                                     frame_id_format=":06d",
+                                     file_ext=".npz",
                                      prefix=args.prefix,
                                      suffix=resolve_sequence_suffix(args.camera, args.seq_mode),
                                      subsampling_rate=args.subsampling_rate,
@@ -295,6 +329,18 @@ if __name__ == "__main__":
                                      cameras=cameras,
                                      img_track_pattern="*_{camera_id}",
                                      frame_id_format=":06d",
+                                     prefix=args.prefix,
+                                     suffix=resolve_sequence_suffix(args.camera, args.seq_mode),
+                                     subsampling_rate=args.subsampling_rate,
+                                     max_stride=args.max_stride,
+                                     seq_mode=args.seq_mode)
+    elif args.dataset == "nuscenes":
+        cameras = resolve_cameras(args.dataset, args.camera, args.seq_mode)
+        seq_maker = SeqMaker(preprocessed_dir="nuscenes_processed",
+                                     cameras=cameras,
+                                     img_track_pattern="*_{camera_id}",
+                                     frame_id_format=":06d",
+                                     file_ext=".npz",
                                      prefix=args.prefix,
                                      suffix=resolve_sequence_suffix(args.camera, args.seq_mode),
                                      subsampling_rate=args.subsampling_rate,

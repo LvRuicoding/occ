@@ -1,7 +1,7 @@
-"""Stage-1 lifting: frozen OccAny recon backbone + confidence-weighted voxel lift.
+"""Stage-1 lifting: configurable OccAny recon backbone + confidence-weighted voxel lift.
 
 Implements stage1.txt:
-- Frozen Dust3rEncoder + Must3rDecoder run once on 5 frames (target frame
+- Dust3rEncoder + Must3rDecoder run once on 5 frames (target frame
   first → reconstruction reference). Outputs T_rec (patch tokens),
   P_rec_global (pixel pointmaps in refcam coords), C_rec (pixel confidence).
 - Pixel feature MLP consumes nearest-upsampled T_rec concatenated with
@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from .. import _paths  # noqa: F401
 
-from typing import Dict, List, Optional, Tuple
+from contextlib import nullcontext
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,8 @@ from occany.must3r_inference import (
 )
 from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
 
+from .encoder_lidar_fusion import EncoderLidarFusion, parse_encoder_lidar_layers
+
 
 class _DecoderNormCapturer:
     """Forward-hook helper that records the output of decoder.norm_dec.
@@ -36,13 +39,13 @@ class _DecoderNormCapturer:
     the first token along N is the pose token.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, detach_output: bool = True) -> None:
         self._handle = None
         self._captured: Optional[torch.Tensor] = None
+        self.detach_output = bool(detach_output)
 
     def _hook(self, module, inputs, output):
-        # Detach immediately — backbone is frozen and we never need gradients.
-        self._captured = output.detach()
+        self._captured = output.detach() if self.detach_output else output
 
     def attach(self, norm_module: nn.Module) -> None:
         if self._handle is not None:
@@ -64,7 +67,7 @@ class _DecoderNormCapturer:
 
 
 class OccAnyRecon5FrameBackbone(nn.Module):
-    """Frozen OccAny reconstruction encoder + decoder for 5 (or N) frames.
+    """OccAny reconstruction encoder + decoder for 5 (or N) frames.
 
     The first view passed in `forward(views)` is the reconstruction reference;
     the rest are joined via Must3rDecoder's joint pass. `p_rec_global` is in
@@ -81,11 +84,18 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         embed_dim: int = 768,
         patch_size: int = 16,
         backbone_dtype: torch.dtype = torch.bfloat16,
+        freeze: bool = True,
+        encoder_lidar_layers: Optional[str | Sequence[int]] = None,
+        encoder_lidar_alpha_init: float = 1.0,
+        encoder_lidar_num_heads: int = 8,
+        encoder_lidar_window: int = 4,
+        encoder_lidar_vfe_d_voxel: int = 128,
     ) -> None:
         super().__init__()
         self.patch_size = int(patch_size)
         self.embed_dim = int(embed_dim)
         self.backbone_dtype = backbone_dtype
+        self.freeze = bool(freeze)
 
         self.encoder = Dust3rEncoder()
         self.decoder = Must3rDecoder(
@@ -100,18 +110,47 @@ class OccAnyRecon5FrameBackbone(nn.Module):
             use_multitask_token=True,
         )
 
+        self._capturer = _DecoderNormCapturer(detach_output=self.freeze)
+        self.encoder_lidar_layers = parse_encoder_lidar_layers(
+            encoder_lidar_layers,
+            depth=int(getattr(self.encoder, "depth", 24)),
+        )
+        H_t = int(img_size[0]) // self.patch_size
+        W_t = int(img_size[1]) // self.patch_size
+        self.encoder_lidar_fusion = (
+            EncoderLidarFusion(
+                d_model=int(enc_embed_dim),
+                selected_layers=self.encoder_lidar_layers,
+                H_t=H_t,
+                W_t=W_t,
+                patch_size=self.patch_size,
+                num_heads=int(encoder_lidar_num_heads),
+                window=int(encoder_lidar_window),
+                vfe_d_voxel=int(encoder_lidar_vfe_d_voxel),
+                alpha_init=float(encoder_lidar_alpha_init),
+            )
+            if self.encoder_lidar_layers
+            else None
+        )
+        self.set_frozen(self.freeze)
+
+    def set_frozen(self, freeze: bool = True) -> None:
+        self.freeze = bool(freeze)
+        self._capturer.detach_output = self.freeze
         for p in self.parameters():
-            p.requires_grad = False
-        self.encoder.eval()
-        self.decoder.eval()
+            p.requires_grad = not self.freeze
+        if self.freeze:
+            self.encoder.eval()
+            self.decoder.eval()
+        else:
+            self.encoder.train(self.training)
+            self.decoder.train(self.training)
 
-        self._capturer = _DecoderNormCapturer()
-
-    # Keep the backbone in eval mode regardless of outer .train() calls.
     def train(self, mode: bool = True):
         super().train(mode)
-        self.encoder.eval()
-        self.decoder.eval()
+        if self.freeze:
+            self.encoder.eval()
+            self.decoder.eval()
         return self
 
     def load_checkpoint(self, ckpt_path: str) -> None:
@@ -133,16 +172,23 @@ class OccAnyRecon5FrameBackbone(nn.Module):
                 print(f"[OccAnyRecon5FrameBackbone] pointmaps_activation set to {pm_act}")
         del ckpt
 
-    @torch.no_grad()
     def forward(
         self,
         views: List[Dict[str, torch.Tensor]],
         device: Optional[torch.device] = None,
+        points_per_frame: Optional[List[List[torch.Tensor]]] = None,
+        T_cam_from_velo: Optional[torch.Tensor] = None,
+        K_per_frame: Optional[torch.Tensor] = None,
+        image_hw: Optional[torch.Tensor] = None,
+        fusion_vox_origin: Optional[torch.Tensor] = None,
+        fusion_vox_size: Optional[torch.Tensor] = None,
+        fusion_vox_grid: Optional[Tuple[int, int, int]] = None,
     ) -> Dict[str, torch.Tensor]:
         if device is None:
             device = views[0]["img"].device
 
-        with torch.autocast("cuda", dtype=self.backbone_dtype):
+        grad_context = torch.no_grad() if self.freeze else nullcontext()
+        with grad_context, torch.autocast("cuda", dtype=self.backbone_dtype):
             imgs, true_shape, _mem_batches, _timesteps = (
                 prepare_imgs_or_raymaps_and_true_shape_mem_batches(
                     views, device, is_raymap=False
@@ -150,13 +196,47 @@ class OccAnyRecon5FrameBackbone(nn.Module):
             )
             B, nimgs = imgs.shape[:2]
 
-            x, pos = inference_encoder(
-                encoder=self.encoder,
-                imgs=imgs,
-                true_shape_view=true_shape.view(B * nimgs, 2),
-                max_bs=None,
-                requires_grad=False,
-            )
+            if self.encoder_lidar_fusion is None:
+                x, pos = inference_encoder(
+                    encoder=self.encoder,
+                    imgs=imgs,
+                    true_shape_view=true_shape.view(B * nimgs, 2),
+                    max_bs=None,
+                    requires_grad=not self.freeze,
+                )
+            else:
+                if (
+                    points_per_frame is None
+                    or T_cam_from_velo is None
+                    or K_per_frame is None
+                    or image_hw is None
+                ):
+                    raise RuntimeError(
+                        "encoder LiDAR fusion requires points_per_frame, "
+                        "T_cam_from_velo, K_per_frame, and image_hw."
+                    )
+                encoder_lidar_context = self.encoder_lidar_fusion.build_context(
+                    points_per_frame=points_per_frame,
+                    T_cam_from_velo=T_cam_from_velo,
+                    K_per_frame=K_per_frame,
+                    image_hw=image_hw,
+                    B=B,
+                    N=nimgs,
+                    device=device,
+                    fusion_vox_origin=fusion_vox_origin,
+                    fusion_vox_size=fusion_vox_size,
+                    fusion_vox_grid=fusion_vox_grid,
+                )
+                imgs_view = imgs.reshape(B * nimgs, *imgs.shape[2:])
+                true_shape_view = true_shape.view(B * nimgs, 2)
+                x_flat, pos_flat = self.encoder(
+                    imgs_view,
+                    true_shape_view,
+                    encoder_lidar_fusion=self.encoder_lidar_fusion,
+                    encoder_lidar_context=encoder_lidar_context,
+                )
+                x = x_flat.view(B, nimgs, *x_flat.shape[1:])
+                pos = pos_flat.view(B, nimgs, *pos_flat.shape[1:])
 
             # Joint decoder pass: first frame is reference (no image2_embed),
             # remaining nimgs-1 frames get image2_embed.
@@ -199,14 +279,21 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         dense = dense_with_pose[:, 1:, :].float()           # drop pose token
         t_rec = dense.view(B, nimgs, H_t, W_t, D).contiguous()
 
-        p_rec_global = post["pts3d"].float().detach()       # (B, nimgs, H_p, W_p, 3)
+        p_rec_global = post["pts3d"].float()                # (B, nimgs, H_p, W_p, 3)
         p_rec_local = post.get("pts3d_local", None)
         if p_rec_local is not None:
-            p_rec_local = p_rec_local.float().detach()      # (B, nimgs, H_p, W_p, 3)
-        c_rec = post["conf"].float().detach()               # (B, nimgs, H_p, W_p)
+            p_rec_local = p_rec_local.float()               # (B, nimgs, H_p, W_p, 3)
+        c_rec = post["conf"].float()                        # (B, nimgs, H_p, W_p)
+
+        if self.freeze:
+            t_rec = t_rec.detach()
+            p_rec_global = p_rec_global.detach()
+            if p_rec_local is not None:
+                p_rec_local = p_rec_local.detach()
+            c_rec = c_rec.detach()
 
         return dict(
-            t_rec=t_rec.detach(),
+            t_rec=t_rec,
             p_rec_global=p_rec_global,
             p_rec_local=p_rec_local,
             c_rec=c_rec,

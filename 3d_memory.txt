@@ -1,1 +1,0 @@
-保存下来每帧的在当前帧下的体素特征，将历史帧的体素特征变换到参考帧的坐标系下，然后聚合成一个3d feature，将这个3d feature和经过了lidar lift的3d feature做自注意力(利用natten库，稍后会装)，然后将经过自注意力的lidar lift的 3d feature送入后续网络

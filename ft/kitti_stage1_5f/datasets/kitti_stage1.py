@@ -27,6 +27,8 @@ from torch.utils.data import Dataset
 from occany.utils.helpers import crop_resize_if_necessary
 from occany.utils.image_util import ImgNorm
 
+from .unified_occ import KITTI_GRID_CONFIG
+
 
 KITTI_SSC_CLASS_NAMES = (
     "empty", "car", "bicycle", "motorcycle", "truck", "other-vehicle",
@@ -99,7 +101,6 @@ class Kitti5FrameStage1Dataset(Dataset):
         frame_stride: int = 1,
         output_resolution: Tuple[int, int] = (512, 160),
         cam_idx: int = 0,
-        load_dense_depth: bool = False,
     ) -> None:
         super().__init__()
         if split not in KITTI_SPLITS:
@@ -110,7 +111,6 @@ class Kitti5FrameStage1Dataset(Dataset):
         self.frame_stride = int(frame_stride)
         self.output_resolution = (int(output_resolution[0]), int(output_resolution[1]))
         self.cam_idx = int(cam_idx)
-        self.load_dense_depth = bool(load_dense_depth)
 
         self.class_names: Tuple[str, ...] = KITTI_SSC_CLASS_NAMES
         self.n_classes = len(self.class_names)
@@ -120,6 +120,7 @@ class Kitti5FrameStage1Dataset(Dataset):
         self.voxel_origin = np.array([0.0, -25.6, -2.0], dtype=np.float32)
         self.voxel_size = np.array([0.2, 0.2, 0.2], dtype=np.float32)
         self.grid_size = np.array([256, 256, 32], dtype=np.int64)
+        self.grid_config = KITTI_GRID_CONFIG
 
         # Per-sequence cache: { seq: {"calib": dict, "T_velo_from_cam2": (4,4)} }
         self._seq_cache: Dict[str, Dict[str, Any]] = {}
@@ -204,25 +205,15 @@ class Kitti5FrameStage1Dataset(Dataset):
         # cam2world is kept around for debug/extension but not needed for lifting.
         cam2world = np.asarray(npz["cam2world"], dtype=np.float64)
 
-        load_view_dense_depth = self.load_dense_depth and int(timestep_index) == 0
-        has_dense_depth = load_view_dense_depth and "dense_depthmap" in npz.files
-        if load_view_dense_depth and has_dense_depth:
-            dense_depth = np.asarray(npz["dense_depthmap"], dtype=np.float32)
-            if dense_depth.shape != image.shape[:2]:
-                raise RuntimeError(
-                    f"dense_depthmap shape {dense_depth.shape} does not match "
-                    f"image shape {image.shape[:2]} for {self._frame_npz(seq, frame)}"
-                )
-        else:
-            dense_depth = np.zeros(image.shape[:2], dtype=np.float32)
+        place_holder_depth = np.zeros(image.shape[:2], dtype=np.float32)
         img_pil = Image.fromarray(image)
-        img_pil_out, dense_depth_out, intr_out = crop_resize_if_necessary(
-            img_pil, dense_depth, intrinsics, self.output_resolution
+        img_pil_out, _, intr_out = crop_resize_if_necessary(
+            img_pil, place_holder_depth, intrinsics, self.output_resolution
         )
         img_arr = np.asarray(img_pil_out)
         H, W = img_arr.shape[:2]
         img_tensor = ImgNorm(img_arr)  # (3, H, W) float in [-1, 1]
-        view = dict(
+        return dict(
             img=img_tensor,
             true_shape=np.int32((H, W)),
             camera_pose=np.eye(4, dtype=np.float32),
@@ -234,10 +225,6 @@ class Kitti5FrameStage1Dataset(Dataset):
             frame_id=int(frame),
             label=f"{seq}_{frame:06d}_cam{self.cam_idx}",
         )
-        if load_view_dense_depth:
-            view["dense_depth"] = np.asarray(dense_depth_out, dtype=np.float32)
-            view["has_dense_depth"] = bool(has_dense_depth)
-        return view
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         seq, t = self.samples[index]
@@ -258,13 +245,21 @@ class Kitti5FrameStage1Dataset(Dataset):
                 f"voxel_label shape {voxel_label.shape} != grid_size {tuple(self.grid_size.tolist())}"
             )
 
+        grid = self.grid_config.as_tensors()
         return dict(
             views=views,
             voxel_label=torch.from_numpy(voxel_label).long(),
             T_target_from_refcam=torch.from_numpy(T_velo_from_cam2.astype(np.float32)),
-            voxel_origin=torch.from_numpy(self.voxel_origin.copy()),
-            voxel_size=torch.from_numpy(self.voxel_size.copy()),
-            grid_size=torch.from_numpy(self.grid_size.copy()),
+            voxel_origin=grid["voxel_origin"],
+            voxel_size=grid["voxel_size"],
+            grid_size=grid["grid_size"],
+            half_voxel_origin=grid["half_voxel_origin"],
+            half_voxel_size=grid["half_voxel_size"],
+            half_grid_size=grid["half_grid_size"],
+            fusion_vox_origin=grid["fusion_vox_origin"],
+            fusion_vox_size=grid["fusion_vox_size"],
+            fusion_vox_grid=grid["fusion_vox_grid"],
+            dataset_name="kitti",
             sequence=seq,
             target_frame_id=int(t),
             frame_ids=tuple(int(f) for f in frame_ids),
@@ -297,6 +292,13 @@ def collate_stage1(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         voxel_origin=torch.stack([b["voxel_origin"] for b in batch], dim=0),
         voxel_size=torch.stack([b["voxel_size"] for b in batch], dim=0),
         grid_size=torch.stack([b["grid_size"] for b in batch], dim=0),
+        half_voxel_origin=torch.stack([b["half_voxel_origin"] for b in batch], dim=0),
+        half_voxel_size=torch.stack([b["half_voxel_size"] for b in batch], dim=0),
+        half_grid_size=torch.stack([b["half_grid_size"] for b in batch], dim=0),
+        fusion_vox_origin=torch.stack([b["fusion_vox_origin"] for b in batch], dim=0),
+        fusion_vox_size=torch.stack([b["fusion_vox_size"] for b in batch], dim=0),
+        fusion_vox_grid=torch.stack([b["fusion_vox_grid"] for b in batch], dim=0),
+        dataset_name=[b.get("dataset_name", "kitti") for b in batch],
         sequence=[b["sequence"] for b in batch],
         target_frame_id=[b["target_frame_id"] for b in batch],
         frame_ids=[b["frame_ids"] for b in batch],

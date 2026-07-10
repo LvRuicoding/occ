@@ -180,11 +180,16 @@ class BEVDetOcc3DHead(nn.Module):
             nn.Linear(int(neck_channels) * 2, int(num_classes)),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        full_grid: Tuple[int, int, int] | None = None,
+    ) -> torch.Tensor:
+        target_grid = self.full_grid if full_grid is None else tuple(int(v) for v in full_grid)
         x = self.neck(self.backbone(x))
         x = F.interpolate(
             x.to(dtype=torch.float32),
-            size=self.full_grid,
+            size=target_grid,
             mode="trilinear",
             align_corners=False,
         ).to(dtype=x.dtype)
