@@ -50,8 +50,8 @@ final_ckpt() {
   printf '%s\n' "${exp_dir}/${latest}"
 }
 
-POSTFUSION_DIR=${POSTFUSION_DIR:-/home/dataset-local/lr/code/OccAny/output/kitti_stage1_5f_4gpu_det_postfusion_only}
-ORIGINAL_DIR=${ORIGINAL_DIR:-/home/dataset-local/lr/code/OccAny/output/kitti_stage1_5f_4gpu_det_original}
+POSTFUSION_DIR=${POSTFUSION_DIR:-/home/dataset-local/lr/code/OccAny/output/kitti_stage1_5f_4gpu_det_postfusion_only_fix}
+ORIGINAL_DIR=${ORIGINAL_DIR:-/home/dataset-local/lr/code/OccAny/output/kitti_stage1_5f_4gpu_det_original_fix}
 
 missing_ckpt=0
 if [[ -z "${POSTFUSION_CKPT:-}" ]] && ! POSTFUSION_CKPT=$(final_ckpt "${POSTFUSION_DIR}"); then

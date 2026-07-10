@@ -11,6 +11,7 @@ from .lidar_fusion import (
     WindowedCrossAttnLayer,
     WindowedSelfAttnLayer,
 )
+from .encoder_lidar_fusion import EncoderLidarFusion, EncoderLidarFusionLayer
 from .stage1_ssc_mono_lidar import Stage1SSCMonoLidarModel
 from .stage1_ssc_bevdetocc_lidar import Stage1SSCBEVDetOccLidarModel
 from .stage1_ssc_bevdetocc_lidar_dense_depth import (
@@ -67,4 +68,6 @@ __all__ = [
     "VoxelFeatureEncoder",
     "WindowedCrossAttnLayer",
     "WindowedSelfAttnLayer",
+    "EncoderLidarFusion",
+    "EncoderLidarFusionLayer",
 ]

@@ -300,6 +300,9 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="If >0, cap validation iterations under --multi_dataset.")
     p.add_argument("--init_from", default=None, type=str,
                    help="Warm-start model weights from a checkpoint without restoring optimizer/epoch.")
+    p.add_argument("--init_from_include_backbone", action="store_true",
+                   help="When using --init_from, also load matching backbone tensors. "
+                        "Default keeps the existing behavior of skipping backbone.*.")
     p.add_argument("--head_lr", type=float, default=1e-4,
                    help="LR for BEV/SSC head modules when using grouped optimizer.")
     p.add_argument("--classifier_lr", type=float, default=2e-4,
@@ -344,6 +347,18 @@ def get_args_parser() -> argparse.ArgumentParser:
                    help="LiDAR/image fusion interaction for --exp=monoscene_lidar. "
                         "'self' uses image+voxel window self-attention; 'cross' "
                         "keeps the original image-query/voxel-KV cross-attention.")
+    p.add_argument("--encoder_lidar_layers", default="", type=str,
+                   help="1-based comma-separated must3r encoder block ids that receive "
+                        "LiDAR fusion before the block MLP, e.g. '8,12,16'. "
+                        "Empty disables encoder-side LiDAR fusion.")
+    p.add_argument("--encoder_lidar_alpha_init", type=float, default=1.0,
+                   help="Initial alpha gate for encoder-side LiDAR fusion residuals.")
+    p.add_argument("--encoder_lidar_num_heads", type=int, default=8,
+                   help="Attention heads for encoder-side LiDAR fusion.")
+    p.add_argument("--encoder_lidar_window", type=int, default=4,
+                   help="2D window size for encoder-side LiDAR fusion.")
+    p.add_argument("--encoder_lidar_vfe_d_voxel", type=int, default=128,
+                   help="Per-voxel VFE hidden/output width before projection for encoder fusion.")
     p.add_argument("--fusion3d", action="store_true",
                    help="Enable the extra 3D sorted image/voxel self-attention "
                         "fusion after the 2D LiDAR/image fusion block.")
@@ -829,7 +844,7 @@ def _load_class_weights(args) -> torch.Tensor:
     return torch.ones(len(UNIFIED_SSC_CLASS_NAMES), dtype=torch.float32)
 
 
-def _load_init_from(model: nn.Module, ckpt_path: str) -> None:
+def _load_init_from(model: nn.Module, ckpt_path: str, *, include_backbone: bool = False) -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "model" in ckpt:
         state = ckpt["model"]
@@ -841,7 +856,9 @@ def _load_init_from(model: nn.Module, ckpt_path: str) -> None:
         if "fusion" in ckpt:
             state.update({f"fusion.{k}": v for k, v in ckpt["fusion"].items()})
     model_state = model.state_dict()
-    state = _strip_module_prefix(_filter_state_dict_without_backbone(state))
+    state = _strip_module_prefix(state)
+    if not include_backbone:
+        state = _filter_state_dict_without_backbone(state)
     wants_unified_head = any(
         k.endswith("occ_head.predicter.2.weight")
         and isinstance(v, torch.Tensor)
@@ -863,6 +880,7 @@ def _load_init_from(model: nn.Module, ckpt_path: str) -> None:
     status = model.load_state_dict(compatible, strict=False)
     print(
         f"[init_from] loaded {len(compatible)} tensors from {ckpt_path}; "
+        f"include_backbone={include_backbone} "
         f"skipped_shape={len(missing_shape)} missing={len(status.missing_keys)} "
         f"unexpected={len(status.unexpected_keys)}"
     )
@@ -2104,6 +2122,11 @@ def main():
         model_kwargs["freeze_backbone"] = args.freeze_backbone
         if args.exp == "depth_postfusion_only":
             model_kwargs["backbone"] = args.backbone
+            model_kwargs["encoder_lidar_layers"] = args.encoder_lidar_layers
+            model_kwargs["encoder_lidar_alpha_init"] = args.encoder_lidar_alpha_init
+            model_kwargs["encoder_lidar_num_heads"] = args.encoder_lidar_num_heads
+            model_kwargs["encoder_lidar_window"] = args.encoder_lidar_window
+            model_kwargs["encoder_lidar_vfe_d_voxel"] = args.encoder_lidar_vfe_d_voxel
     if args.exp in DET_EXPS:
         model_kwargs["num_frames"] = args.num_frames
         model_kwargs["freeze_backbone"] = args.freeze_backbone
@@ -2168,6 +2191,14 @@ def main():
             )
         if args.exp == "depth_postfusion_only":
             print("[fusion] attn_type=cross (depth-only post-fusion branch)")
+            if args.encoder_lidar_layers:
+                print(
+                    "[encoder_lidar_fusion] "
+                    f"layers={args.encoder_lidar_layers} "
+                    f"alpha_init={args.encoder_lidar_alpha_init} "
+                    f"heads={args.encoder_lidar_num_heads} "
+                    f"window={args.encoder_lidar_window}"
+                )
         if args.exp == "depth_promptfusion_only":
             print(
                 "[fusion] prompt_depth=lidar_sparse+mask "
@@ -2254,7 +2285,18 @@ def main():
         print(f"Backbone state_dict hash: {backbone_hash}")
 
     if args.init_from:
-        _load_init_from(model, args.init_from)
+        _load_init_from(
+            model,
+            args.init_from,
+            include_backbone=bool(args.init_from_include_backbone),
+        )
+        if (
+            bool(args.init_from_include_backbone)
+            and hasattr(model, "backbone")
+            and getattr(args, "backbone", "must3r") == "must3r"
+        ):
+            backbone_hash = _state_dict_hash(model.backbone.state_dict())
+            print(f"Backbone state_dict hash after init_from: {backbone_hash}")
 
     # Convert BN -> SyncBN before DDP wrap. At per-GPU bs=1 the MonoScene
     # head's BatchNorm3d layers see one-sample stats per forward, which both

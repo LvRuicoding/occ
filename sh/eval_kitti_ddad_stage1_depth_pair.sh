@@ -46,8 +46,8 @@ run_eval() {
   fi
 }
 
-ORIG_DIR=/home/dataset-local/lr/code/OccAny/output/kitti_ddad_stage1_5f_4gpu_depth_original
-POST_DIR=/home/dataset-local/lr/code/OccAny/output/kitti_ddad_stage1_5f_4gpu_depth_postfusion_only
+ORIG_DIR=/home/dataset-local/lr/code/OccAny/output/kitti_ddad_stage1_5f_4gpu_depth_original_fix
+POST_DIR=/home/dataset-local/lr/code/OccAny/output/kitti_ddad_stage1_5f_4gpu_depth_postfusion_only_fix
 
 run_eval "${ORIG_DIR}/checkpoint-last.pth" kitti "${ORIG_DIR}/depth_metrics_kitti.json"
 run_eval "${ORIG_DIR}/checkpoint-last.pth" ddad "${ORIG_DIR}/depth_metrics_ddad.json"

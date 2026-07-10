@@ -1,7 +1,7 @@
 """Incremental pointmap ablation models for KITTI Stage-1 experiments."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,11 @@ def _make_recon_backbone(
     patch_size: int,
     backbone_dtype: torch.dtype,
     freeze: bool,
+    encoder_lidar_layers: Optional[str | Sequence[int]] = None,
+    encoder_lidar_alpha_init: float = 1.0,
+    encoder_lidar_num_heads: int = 8,
+    encoder_lidar_window: int = 4,
+    encoder_lidar_vfe_d_voxel: int = 128,
 ) -> nn.Module:
     backbone = str(backbone).lower()
     if backbone in ("must3r", "occany"):
@@ -32,8 +37,15 @@ def _make_recon_backbone(
             patch_size=patch_size,
             backbone_dtype=backbone_dtype,
             freeze=freeze,
+            encoder_lidar_layers=encoder_lidar_layers,
+            encoder_lidar_alpha_init=encoder_lidar_alpha_init,
+            encoder_lidar_num_heads=encoder_lidar_num_heads,
+            encoder_lidar_window=encoder_lidar_window,
+            encoder_lidar_vfe_d_voxel=encoder_lidar_vfe_d_voxel,
         )
     if backbone in ("da3", "occany+", "occany_plus"):
+        if encoder_lidar_layers not in (None, "", (), []):
+            raise ValueError("encoder_lidar_layers is supported only for the must3r backbone.")
         from .da3_backbone import OccAnyDA3Recon5FrameBackbone
 
         return OccAnyDA3Recon5FrameBackbone(
@@ -170,6 +182,11 @@ class Stage1DepthPostFusionOnlyModel(nn.Module):
         fusion_d_voxel: int = 128,
         fusion_pe_num_freqs: int = 8,
         fusion_attn_type: str = "cross",
+        encoder_lidar_layers: Optional[str | Sequence[int]] = None,
+        encoder_lidar_alpha_init: float = 1.0,
+        encoder_lidar_num_heads: int = 8,
+        encoder_lidar_window: int = 4,
+        encoder_lidar_vfe_d_voxel: int = 128,
         **_unused,
     ) -> None:
         super().__init__()
@@ -188,6 +205,14 @@ class Stage1DepthPostFusionOnlyModel(nn.Module):
             patch_size=patch_size,
             backbone_dtype=backbone_dtype,
             freeze=self.freeze_backbone,
+            encoder_lidar_layers=encoder_lidar_layers,
+            encoder_lidar_alpha_init=encoder_lidar_alpha_init,
+            encoder_lidar_num_heads=encoder_lidar_num_heads,
+            encoder_lidar_window=encoder_lidar_window,
+            encoder_lidar_vfe_d_voxel=encoder_lidar_vfe_d_voxel,
+        )
+        self.encoder_lidar_enabled = (
+            getattr(self.backbone, "encoder_lidar_fusion", None) is not None
         )
         if occany_ckpt is not None:
             self.backbone.load_checkpoint(occany_ckpt)
@@ -259,7 +284,16 @@ class Stage1DepthPostFusionOnlyModel(nn.Module):
                 fusion_grid = tuple(int(v) for v in value.detach().cpu().tolist())
             elif value is not None:
                 fusion_grid = tuple(int(v) for v in value)
-        backbone_out = self.backbone(views)
+        backbone_out = self.backbone(
+            views,
+            points_per_frame=points_per_frame if self.encoder_lidar_enabled else None,
+            T_cam_from_velo=T_cam_from_velo if self.encoder_lidar_enabled else None,
+            K_per_frame=K_per_frame if self.encoder_lidar_enabled else None,
+            image_hw=image_hw if self.encoder_lidar_enabled else None,
+            fusion_vox_origin=fusion_origin if self.encoder_lidar_enabled else None,
+            fusion_vox_size=fusion_size if self.encoder_lidar_enabled else None,
+            fusion_vox_grid=fusion_grid if self.encoder_lidar_enabled else None,
+        )
         t_rec_fused = self.fusion(
             backbone_out["t_rec"],
             points_per_frame=points_per_frame,

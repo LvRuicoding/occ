@@ -100,6 +100,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     p.add_argument("--ddad_raw_root", default=None, type=str, help="Override DDAD raw root.")
     p.add_argument("--occany_ckpt", default=None, type=str, help="Override OccAny backbone checkpoint path.")
     p.add_argument("--velodyne_root", default=None, type=str, help="Override/deprecated KITTI velodyne root.")
+    p.add_argument("--encoder_lidar_layers", default=None, type=str,
+                   help="Override checkpoint encoder-side LiDAR fusion layers.")
+    p.add_argument("--encoder_lidar_alpha_init", default=None, type=float)
+    p.add_argument("--encoder_lidar_num_heads", default=None, type=int)
+    p.add_argument("--encoder_lidar_window", default=None, type=int)
+    p.add_argument("--encoder_lidar_vfe_d_voxel", default=None, type=int)
     p.add_argument("--device", default="auto", type=str)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
@@ -181,6 +187,21 @@ def _fill_args_from_checkpoint(args: argparse.Namespace, ckpt_args) -> None:
     args.prompt_depth_scale = _ckpt_arg(ckpt_args, "prompt_depth_scale", "log")
     args.prompt_depth_min = float(_ckpt_arg(ckpt_args, "prompt_depth_min", 1e-3))
     args.prompt_depth_max = float(_ckpt_arg(ckpt_args, "prompt_depth_max", 120.0))
+    args.encoder_lidar_layers = _override_or_ckpt(
+        args, ckpt_args, "encoder_lidar_layers", ""
+    )
+    args.encoder_lidar_alpha_init = float(
+        _override_or_ckpt(args, ckpt_args, "encoder_lidar_alpha_init", 1.0)
+    )
+    args.encoder_lidar_num_heads = int(
+        _override_or_ckpt(args, ckpt_args, "encoder_lidar_num_heads", 8)
+    )
+    args.encoder_lidar_window = int(
+        _override_or_ckpt(args, ckpt_args, "encoder_lidar_window", 4)
+    )
+    args.encoder_lidar_vfe_d_voxel = int(
+        _override_or_ckpt(args, ckpt_args, "encoder_lidar_vfe_d_voxel", 128)
+    )
     args.max_points_per_sweep = int(_ckpt_arg(ckpt_args, "max_points_per_sweep", 0))
     args.freeze_backbone = bool(_ckpt_arg(ckpt_args, "freeze_backbone", True))
     args.batch_size = int(_override_or_ckpt(args, ckpt_args, "batch_size", 1))
@@ -264,6 +285,12 @@ def _build_depth_eval_model(args: argparse.Namespace, device: torch.device) -> t
         model_kwargs["fusion_attn_type"] = "cross"
     if args.exp in ("depth_original", "depth_postfusion_only"):
         model_kwargs["backbone"] = args.backbone
+    if args.exp == "depth_postfusion_only":
+        model_kwargs["encoder_lidar_layers"] = args.encoder_lidar_layers
+        model_kwargs["encoder_lidar_alpha_init"] = args.encoder_lidar_alpha_init
+        model_kwargs["encoder_lidar_num_heads"] = args.encoder_lidar_num_heads
+        model_kwargs["encoder_lidar_window"] = args.encoder_lidar_window
+        model_kwargs["encoder_lidar_vfe_d_voxel"] = args.encoder_lidar_vfe_d_voxel
     return model_cls(**model_kwargs).to(device)
 
 

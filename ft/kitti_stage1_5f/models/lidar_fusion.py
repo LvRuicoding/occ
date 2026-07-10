@@ -313,13 +313,14 @@ class WindowedCrossAttnLayer(nn.Module):
         voxel_h_t: torch.Tensor,         # (V_total,) int64
         voxel_w_t: torch.Tensor,         # (V_total,) int64
         voxel_valid: torch.Tensor,       # (V_total,) bool
+        return_update: bool = False,
     ) -> torch.Tensor:
         F_n, H_t, W_t, D = image_feat.shape
         device = image_feat.device
 
         # If nothing valid → identity.
         if voxel_valid.sum().item() == 0:
-            return image_feat
+            return torch.zeros_like(image_feat) if return_update else image_feat
 
         # Restrict to valid voxels.
         vf_idx = voxel_frame_idx[voxel_valid]
@@ -407,8 +408,8 @@ class WindowedCrossAttnLayer(nn.Module):
 
         # Gather destination indices.
         valid_pos = q_mask  # (n_active, M_Q)
-        # Output image (we modify a copy to avoid in-place issues with autograd).
-        out = image_feat.clone()
+        # Output image/update (we modify a copy to avoid in-place issues with autograd).
+        out = torch.zeros_like(image_feat) if return_update else image_feat.clone()
         # Use vectorized fancy indexing.
         frame_idx_exp = active_frame.unsqueeze(-1).expand_as(wh_safe)[valid_pos]
         h_idx = wh_safe[valid_pos]

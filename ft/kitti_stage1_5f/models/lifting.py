@@ -14,7 +14,7 @@ from __future__ import annotations
 from .. import _paths  # noqa: F401
 
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,8 @@ from occany.must3r_inference import (
     prepare_imgs_or_raymaps_and_true_shape_mem_batches,
 )
 from occany.utils.checkpoint_io import register_legacy_checkpoint_modules
+
+from .encoder_lidar_fusion import EncoderLidarFusion, parse_encoder_lidar_layers
 
 
 class _DecoderNormCapturer:
@@ -83,6 +85,11 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         patch_size: int = 16,
         backbone_dtype: torch.dtype = torch.bfloat16,
         freeze: bool = True,
+        encoder_lidar_layers: Optional[str | Sequence[int]] = None,
+        encoder_lidar_alpha_init: float = 1.0,
+        encoder_lidar_num_heads: int = 8,
+        encoder_lidar_window: int = 4,
+        encoder_lidar_vfe_d_voxel: int = 128,
     ) -> None:
         super().__init__()
         self.patch_size = int(patch_size)
@@ -104,6 +111,27 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         )
 
         self._capturer = _DecoderNormCapturer(detach_output=self.freeze)
+        self.encoder_lidar_layers = parse_encoder_lidar_layers(
+            encoder_lidar_layers,
+            depth=int(getattr(self.encoder, "depth", 24)),
+        )
+        H_t = int(img_size[0]) // self.patch_size
+        W_t = int(img_size[1]) // self.patch_size
+        self.encoder_lidar_fusion = (
+            EncoderLidarFusion(
+                d_model=int(enc_embed_dim),
+                selected_layers=self.encoder_lidar_layers,
+                H_t=H_t,
+                W_t=W_t,
+                patch_size=self.patch_size,
+                num_heads=int(encoder_lidar_num_heads),
+                window=int(encoder_lidar_window),
+                vfe_d_voxel=int(encoder_lidar_vfe_d_voxel),
+                alpha_init=float(encoder_lidar_alpha_init),
+            )
+            if self.encoder_lidar_layers
+            else None
+        )
         self.set_frozen(self.freeze)
 
     def set_frozen(self, freeze: bool = True) -> None:
@@ -148,6 +176,13 @@ class OccAnyRecon5FrameBackbone(nn.Module):
         self,
         views: List[Dict[str, torch.Tensor]],
         device: Optional[torch.device] = None,
+        points_per_frame: Optional[List[List[torch.Tensor]]] = None,
+        T_cam_from_velo: Optional[torch.Tensor] = None,
+        K_per_frame: Optional[torch.Tensor] = None,
+        image_hw: Optional[torch.Tensor] = None,
+        fusion_vox_origin: Optional[torch.Tensor] = None,
+        fusion_vox_size: Optional[torch.Tensor] = None,
+        fusion_vox_grid: Optional[Tuple[int, int, int]] = None,
     ) -> Dict[str, torch.Tensor]:
         if device is None:
             device = views[0]["img"].device
@@ -161,13 +196,47 @@ class OccAnyRecon5FrameBackbone(nn.Module):
             )
             B, nimgs = imgs.shape[:2]
 
-            x, pos = inference_encoder(
-                encoder=self.encoder,
-                imgs=imgs,
-                true_shape_view=true_shape.view(B * nimgs, 2),
-                max_bs=None,
-                requires_grad=not self.freeze,
-            )
+            if self.encoder_lidar_fusion is None:
+                x, pos = inference_encoder(
+                    encoder=self.encoder,
+                    imgs=imgs,
+                    true_shape_view=true_shape.view(B * nimgs, 2),
+                    max_bs=None,
+                    requires_grad=not self.freeze,
+                )
+            else:
+                if (
+                    points_per_frame is None
+                    or T_cam_from_velo is None
+                    or K_per_frame is None
+                    or image_hw is None
+                ):
+                    raise RuntimeError(
+                        "encoder LiDAR fusion requires points_per_frame, "
+                        "T_cam_from_velo, K_per_frame, and image_hw."
+                    )
+                encoder_lidar_context = self.encoder_lidar_fusion.build_context(
+                    points_per_frame=points_per_frame,
+                    T_cam_from_velo=T_cam_from_velo,
+                    K_per_frame=K_per_frame,
+                    image_hw=image_hw,
+                    B=B,
+                    N=nimgs,
+                    device=device,
+                    fusion_vox_origin=fusion_vox_origin,
+                    fusion_vox_size=fusion_vox_size,
+                    fusion_vox_grid=fusion_vox_grid,
+                )
+                imgs_view = imgs.reshape(B * nimgs, *imgs.shape[2:])
+                true_shape_view = true_shape.view(B * nimgs, 2)
+                x_flat, pos_flat = self.encoder(
+                    imgs_view,
+                    true_shape_view,
+                    encoder_lidar_fusion=self.encoder_lidar_fusion,
+                    encoder_lidar_context=encoder_lidar_context,
+                )
+                x = x_flat.view(B, nimgs, *x_flat.shape[1:])
+                pos = pos_flat.view(B, nimgs, *pos_flat.shape[1:])
 
             # Joint decoder pass: first frame is reference (no image2_embed),
             # remaining nimgs-1 frames get image2_embed.
